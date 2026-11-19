@@ -6,3 +6,6 @@ __pycache__/
 *.priv
 *.pub
 proof.json
+*.so
+*.lock
+subjects.json

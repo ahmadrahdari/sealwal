@@ -1,31 +1,25 @@
-"""Writer side: an append-only log with sealed group commits.
+"""Log writer.
 
-Commit protocol
----------------
-``append()`` only buffers a record in memory. ``commit()`` writes all buffered
-records plus one SEAL frame with a single write() call and then flushes the
-file (fdatasync by default). A record is committed once its seal is durable;
-anything after the last seal is discarded on recovery, exactly like an
-uncommitted transaction in a normal write-ahead log.
+append() only buffers. commit() writes the buffered records plus one SEAL in a
+single write() and flushes. A record counts as committed once its seal is on
+disk; anything after the last seal is dropped on recovery, like an uncommitted
+transaction in a normal WAL.
 
-Signing policies
-----------------
-sign_every=1   (default) every seal is signed before it is written. Strongest:
-               a commit is acknowledged only once it is authenticated. The
-               signature sits on the commit critical path.
-sign_every=k   only every k-th seal is signed inline; seals in between are
-               authenticated by the next signature through the digest chain.
-async_sign     seals are written unsigned and a background thread signs the
-               newest seal digest whenever it is free, appending a SIG frame.
-               Signing is off the critical path; the price is a short
-               *authentication window* in which committed-but-unsigned seals
-               exist (bounded by roughly one signing time).
+Each seal carries the root of the Merkle tree over *all* records so far, so a
+signature over one seal covers the whole log up to that point.
 
-A cleanly closed log is always fully signed: ``close()`` signs the last seal
-if no signature covers it yet.
+Records can be public (subject 0) or belong to a data subject; private ones
+are encrypted and committed with a salt from the subject's key, so shredding
+that key erases them without breaking the log (see privacy.py).
+
+Signing modes:
+  sign_every=1        sign every seal before writing it (default)
+  sign_every=k        sign every k-th seal inline
+  async_sign=True     a background thread signs the newest seal and appends a
+                      SIG frame; commits don't wait for it
+  max_unsigned=K      (async only) commit() blocks while more than K committed
+                      seals are unsigned, which bounds the auth window
 """
-
-from __future__ import annotations
 
 import os
 import threading
@@ -33,14 +27,30 @@ import time
 
 from . import format as fmt
 from . import merkle
-from .signers import Signer
+from .privacy import ZERO_SALT, commit
 from .verify import verify
 
 _SYNC = {
     "fsync": os.fsync,
     "fdatasync": getattr(os, "fdatasync", os.fsync),
-    "none": lambda _fd: None,
+    "none": lambda fd: None,
 }
+
+
+def _flush_fn(sync):
+    # "emulate:25" = pretend each flush takes 25 us (busy wait, no fsync).
+    # The benchmarks use it to model fast remote log services.
+    if sync.startswith("emulate:"):
+        delay = float(sync.split(":", 1)[1]) / 1e6
+
+        def spin(fd):
+            end = time.perf_counter() + delay
+            while time.perf_counter() < end:
+                pass
+        return spin
+    if sync not in _SYNC:
+        raise ValueError(f"sync must be one of {sorted(_SYNC)} or emulate:<us>")
+    return _SYNC[sync]
 
 
 class CorruptLogError(Exception):
@@ -50,194 +60,206 @@ class CorruptLogError(Exception):
 
 
 class SealedLog:
-    """Append-only, tamper-evident log. Thread-safe for concurrent append();
-    commit() may be called from any thread (calls are serialised)."""
-
-    def __init__(self, path, fd, signer: Signer, sync: str, sign_every: int, async_sign: bool,
-                 track_auth_lag: bool = False):
-        if sync not in _SYNC:
-            raise ValueError(f"sync must be one of {sorted(_SYNC)}")
+    def __init__(self, path, fd, signer, sync="fdatasync", sign_every=1,
+                 async_sign=False, max_unsigned=None, track_auth_lag=False, keys=None):
         self.path = os.fspath(path)
         self.signer = signer
+        self.keys = keys
         self._fd = fd
-        self._sync = _SYNC[sync]
+        self._sync = _flush_fn(sync)
         self._sign_every = sign_every
         self._async = async_sign and signer.alg != "none"
+        self._max_unsigned = max_unsigned if self._async else None
 
-        self._lock = threading.Lock()  # protects pending buffer and counters
-        self._commit_lock = threading.Lock()  # serialises commits
-        self._io_lock = threading.Lock()  # serialises write() calls
+        self._lock = threading.Lock()         # buffer + counters
+        self._signed = threading.Condition(self._lock)
+        self._commit_lock = threading.Lock()  # one commit at a time
+        self._io_lock = threading.Lock()      # one write() at a time
 
-        self._pending_frames: list[bytes] = []
-        self._pending_leaves: list[bytes] = []
+        self._frames = []
+        self._leaves = []
+        self._tree = merkle.Frontier()        # committed records only
         self._next_lsn = 1
         self._next_seal = 0
-        self._prev_digest = b""
+        self._prev = b""
+        self._last_digest = None
         self._committed_lsn = 0
         self._signed_seal = -1
-        self._last_seal_digest: bytes | None = None
         self._closed = False
-        # Optional measurement: seconds from a seal becoming durable until a
-        # signature covering it is written (the authentication window).
-        self.auth_lag: list[float] | None = [] if track_auth_lag else None
-        self._commit_t: dict[int, float] = {}
 
-        # asynchronous signer state
+        # benchmarks: time from a seal hitting disk until something signs it
+        self.auth_lag = [] if track_auth_lag else None
+        self._commit_t = {}
+
         self._sig_cv = threading.Condition()
-        self._to_sign: tuple[int, bytes] | None = None
-        self._stop_signer = False
-        self._signer_error: BaseException | None = None
+        self._to_sign = None
+        self._stop = False
+        self._signer_err = None
         self._signer_thread = None
         if self._async:
-            self._signer_thread = threading.Thread(target=self._signer_loop, name="sealwal-signer", daemon=True)
+            self._signer_thread = threading.Thread(target=self._signer_loop, daemon=True)
             self._signer_thread.start()
 
-    # ------------------------------------------------------------------ open
-
     @classmethod
-    def create(cls, path, signer: Signer, *, sync="fdatasync", sign_every=1, async_sign=False,
-               track_auth_lag=False) -> "SealedLog":
-        """Create a new, empty log file (fails if it already exists)."""
+    def create(cls, path, signer, **opts):
+        """New empty log. Fails if the file exists."""
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND, 0o644)
-        header = fmt.Header(signer.alg_id, signer.public_bytes)
-        _write_all(fd, header.encode())
-        _SYNC[sync](fd)
-        log = cls(path, fd, signer, sync, sign_every, async_sign, track_auth_lag)
-        log._prev_digest = header.genesis_digest()
+        hdr = fmt.Header(signer.alg_id, signer.public_bytes)
+        _write_all(fd, hdr.encode())
+        _flush_fn(opts.get("sync", "fdatasync"))(fd)
+        log = cls(path, fd, signer, **opts)
+        log._prev = hdr.genesis_digest()
         return log
 
     @classmethod
-    def open(cls, path, signer: Signer, *, sync="fdatasync", sign_every=1, async_sign=False,
-               track_auth_lag=False) -> "SealedLog":
-        """Open an existing log for appending, after crash recovery.
+    def open(cls, path, signer, **opts):
+        """Reopen after a crash or a clean shutdown.
 
-        The log is verified against ``signer``'s public key. Uncommitted
-        records and torn bytes after the last seal are truncated away. If the
-        tail contains committed but unsigned seals (a crash inside the
-        authentication window), they are signed now: like any WAL, recovery
-        trusts the local disk for that short window.
+        The file is verified against the signer's key first. Torn bytes and
+        records after the last seal get truncated. Seals that were committed
+        but never signed (crash inside the auth window) are signed now, i.e.
+        recovery trusts the local disk for that window, same as any WAL.
         """
-        seals = []
-        rep = verify(path, signer.public_bytes if signer.alg != "none" else None, _seals_out=seals)
+        state = {}
+        key = signer.public_bytes if signer.alg != "none" else None
+        rep = verify(path, key, _state_out=state)
         if not rep.ok:
             raise CorruptLogError(rep)
         os.truncate(path, rep.commit_end_offset)
         fd = os.open(path, os.O_WRONLY | os.O_APPEND)
-        log = cls(path, fd, signer, sync, sign_every, async_sign, track_auth_lag)
-        hdr = fmt.Header(signer.alg_id, signer.public_bytes)
-        log._prev_digest = seals[-1].digest if seals else hdr.genesis_digest()
-        log._last_seal_digest = seals[-1].digest if seals else None
+        log = cls(path, fd, signer, **opts)
+        seals = state["seals"]
+        log._tree = state["tree"]
+        if seals:
+            log._prev = log._last_digest = seals[-1].digest
+        else:
+            log._prev = fmt.Header(signer.alg_id, signer.public_bytes).genesis_digest()
         log._next_seal = len(seals)
         log._committed_lsn = rep.committed_lsn
         log._next_lsn = rep.committed_lsn + 1
-        log._signed_seal = len(seals) - 1 - rep.unauthenticated_seals if signer.alg != "none" else len(seals) - 1
+        log._signed_seal = len(seals) - 1
+        if signer.alg != "none":
+            log._signed_seal -= rep.unauthenticated_seals
         log.recovery_report = rep
         if signer.alg != "none" and log._signed_seal < len(seals) - 1:
-            log._sign_tail_now()
+            log._sign_tail()
         return log
 
-    # ----------------------------------------------------------------- write
-
-    def append(self, payload: bytes) -> int:
-        """Buffer one record; returns its LSN. Not durable until commit()."""
+    def append(self, payload, subject=0):
+        """Buffer a record. subject > 0 makes it private to that data subject
+        (needs keys=KeyStore(...) when opening the log)."""
+        if subject and self.keys is None:
+            raise ValueError("private records need a KeyStore (keys=...)")
         with self._lock:
             if self._closed:
                 raise ValueError("log is closed")
             lsn = self._next_lsn
             self._next_lsn += 1
-            self._pending_frames.append(fmt.encode_data(lsn, payload))
-            self._pending_leaves.append(merkle.leaf_hash(lsn, payload))
+            if subject:
+                salt, body = self.keys.seal(subject, lsn, payload)
+            else:
+                salt, body = ZERO_SALT, payload
+            c = commit(salt, payload)
+            self._frames.append(fmt.encode_data(lsn, subject, c, body))
+            self._leaves.append(merkle.leaf_hash(lsn, c))
             return lsn
 
-    def pending(self) -> int:
+    def pending(self):
         with self._lock:
-            return len(self._pending_frames)
+            return len(self._frames)
 
-    def commit(self) -> fmt.SealRecord | None:
-        """Seal and durably write all buffered records. Returns the seal, or
-        None if nothing was pending."""
-        self._raise_signer_error()
+    def commit(self):
+        """Seal and flush everything buffered. Returns the SealRecord, or None
+        if there was nothing to commit."""
+        self._check_signer()
         with self._commit_lock:
             with self._lock:
-                if not self._pending_frames:
+                if not self._frames:
                     return None
-                frames, leaves = self._pending_frames, self._pending_leaves
-                self._pending_frames, self._pending_leaves = [], []
+                frames, leaves = self._frames, self._leaves
+                self._frames, self._leaves = [], []
                 last = self._next_lsn - 1
                 first = last - len(leaves) + 1
                 seal_no = self._next_seal
                 self._next_seal += 1
-                prev = self._prev_digest
-            root = merkle.root(leaves)
-            seal = fmt.SealRecord(seal_no, first, last, root, prev)
+                prev = self._prev
+
+            # only the committing thread touches the tree
+            for leaf in leaves:
+                self._tree.append(leaf)
+            seal = fmt.SealRecord(seal_no, first, last, self._tree.root(), prev)
             digest = seal.digest()
-            sign_inline = (
-                self.signer.alg != "none"
-                and not self._async
-                and self._sign_every > 0
-                and (seal_no + 1) % self._sign_every == 0
-            )
-            if sign_inline:
-                seal = fmt.SealRecord(seal_no, first, last, root, prev, self.signer.sign(fmt.signed_message(digest)))
-            buf = b"".join(frames) + fmt.encode_seal(seal)
+
+            inline = (self.signer.alg != "none" and not self._async
+                      and self._sign_every > 0 and (seal_no + 1) % self._sign_every == 0)
+            if inline:
+                sig = self.signer.sign(fmt.signed_message(digest))
+                seal = fmt.SealRecord(seal_no, first, last, seal.root, prev, sig)
+
             with self._io_lock:
-                _write_all(self._fd, buf)
+                _write_all(self._fd, b"".join(frames) + fmt.encode_seal(seal))
             self._sync(self._fd)
+
             with self._lock:
-                self._prev_digest = digest
-                self._last_seal_digest = digest
+                self._prev = self._last_digest = digest
                 self._committed_lsn = last
-                if sign_inline:
+                if inline:
                     self._signed_seal = seal_no
-                if self.auth_lag is not None:
-                    if self.signer.alg != "none" and not sign_inline:
-                        self._commit_t[seal_no] = time.perf_counter()
-                    elif sign_inline:
-                        self._record_auth(seal_no)
+                    self._note_signed(seal_no)
+                elif self.auth_lag is not None and self.signer.alg != "none":
+                    self._commit_t[seal_no] = time.perf_counter()
+
             if self._async:
                 with self._sig_cv:
                     self._to_sign = (seal_no, digest)
                     self._sig_cv.notify()
+                if self._max_unsigned is not None:
+                    with self._signed:
+                        while (seal_no - self._signed_seal > self._max_unsigned
+                               and self._signer_err is None):
+                            self._signed.wait()
+                    self._check_signer()
             return seal
 
-    # --------------------------------------------------------------- signing
-
-    def _signer_loop(self) -> None:
+    def _signer_loop(self):
         try:
             while True:
                 with self._sig_cv:
-                    while self._to_sign is None and not self._stop_signer:
+                    while self._to_sign is None and not self._stop:
                         self._sig_cv.wait()
                     if self._to_sign is None:
                         return
                     seal_no, digest = self._to_sign
-                    self._to_sign = None  # newer seals coalesce: sign only the newest
+                    self._to_sign = None   # fell behind? only the newest gets signed
                 sig = self.signer.sign(fmt.signed_message(digest))
                 with self._io_lock:
                     _write_all(self._fd, fmt.encode_sig(seal_no, sig))
-                # No flush here: the next commit's flush makes it durable.
-                with self._lock:
-                    self._record_auth(seal_no)
+                # not flushed here, the next commit's flush picks it up
+                with self._signed:
                     self._signed_seal = max(self._signed_seal, seal_no)
-        except BaseException as e:  # surfaced on the next commit()/close()
-            self._signer_error = e
+                    self._note_signed(seal_no)
+                    self._signed.notify_all()
+        except BaseException as e:
+            with self._signed:
+                self._signer_err = e
+                self._signed.notify_all()
 
-    def _record_auth(self, seal_no: int) -> None:
-        """Called with self._lock held when seals <= seal_no become signed."""
+    def _note_signed(self, seal_no):
+        # caller holds self._lock
         if self.auth_lag is None:
             return
         now = time.perf_counter()
         for j in [j for j in self._commit_t if j <= seal_no]:
             self.auth_lag.append(now - self._commit_t.pop(j))
 
-    def _raise_signer_error(self) -> None:
-        if self._signer_error is not None:
-            raise RuntimeError("background signer failed") from self._signer_error
+    def _check_signer(self):
+        if self._signer_err is not None:
+            raise RuntimeError("background signer failed") from self._signer_err
 
-    def _sign_tail_now(self) -> None:
+    def _sign_tail(self):
         with self._lock:
             seal_no = self._next_seal - 1
-            digest = self._last_seal_digest
+            digest = self._last_digest
             if seal_no < 0 or self._signed_seal >= seal_no:
                 return
         sig = self.signer.sign(fmt.signed_message(digest))
@@ -245,45 +267,40 @@ class SealedLog:
             _write_all(self._fd, fmt.encode_sig(seal_no, sig))
         self._sync(self._fd)
         with self._lock:
-            self._record_auth(seal_no)
             self._signed_seal = seal_no
-
-    # ----------------------------------------------------------------- state
+            self._note_signed(seal_no)
 
     @property
-    def committed_lsn(self) -> int:
-        """Highest LSN whose seal is durable."""
+    def committed_lsn(self):
         with self._lock:
             return self._committed_lsn
 
     @property
-    def signed_seal(self) -> int:
-        """Highest seal number covered by a signature written to the log."""
+    def signed_seal(self):
         with self._lock:
             return self._signed_seal
 
-    def anchor(self) -> tuple[int, bytes] | None:
-        """(seal_no, digest) of the newest durable seal. Store it somewhere the
-        log's storage cannot modify to detect rollback later."""
+    def anchor(self):
+        """(seal_no, digest) of the newest seal. Keep it somewhere the log's
+        storage can't write to; verify(..., anchor=...) then catches rollback."""
         with self._lock:
-            if self._last_seal_digest is None:
+            if self._last_digest is None:
                 return None
-            return self._next_seal - 1, self._last_seal_digest
+            return self._next_seal - 1, self._last_digest
 
-    def close(self, commit_pending: bool = True) -> None:
-        """Optionally commit buffered records, sign the tail, flush, close."""
+    def close(self, commit_pending=True):
         if self._closed:
             return
         if commit_pending:
             self.commit()
         if self._signer_thread is not None:
             with self._sig_cv:
-                self._stop_signer = True
+                self._stop = True
                 self._sig_cv.notify()
             self._signer_thread.join()
-            self._raise_signer_error()
+            self._check_signer()
         if self.signer.alg != "none":
-            self._sign_tail_now()
+            self._sign_tail()
         self._sync(self._fd)
         with self._lock:
             self._closed = True
@@ -297,35 +314,31 @@ class SealedLog:
 
 
 class GroupCommitter:
-    """Classic group commit on top of SealedLog.
+    """Group commit: clients call submit(), which returns once the record is
+    durable. One committer thread seals whatever piled up during the previous
+    flush, so the flush (and the signature) is shared by the whole batch."""
 
-    Client threads call ``submit(payload)``, which returns once the record is
-    durable. A single committer thread seals whatever has accumulated while
-    the previous flush was in progress, so the cost of each flush (and each
-    signature) is shared by all records in the batch.
-    """
-
-    def __init__(self, log: SealedLog):
+    def __init__(self, log):
         self.log = log
+        self.batches = []
         self._cv = threading.Condition()
-        self._durable_lsn = log.committed_lsn
+        self._durable = log.committed_lsn
         self._stop = False
-        self._error: BaseException | None = None
-        self.batches: list[int] = []  # batch sizes, for measurements
-        self._thread = threading.Thread(target=self._run, name="sealwal-committer", daemon=True)
-        self._thread.start()
+        self._err = None
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
 
-    def submit(self, payload: bytes) -> int:
+    def submit(self, payload):
         lsn = self.log.append(payload)
         with self._cv:
             self._cv.notify_all()
-            while self._durable_lsn < lsn and self._error is None:
+            while self._durable < lsn and self._err is None:
                 self._cv.wait()
-            if self._error is not None:
-                raise RuntimeError("group commit failed") from self._error
+            if self._err is not None:
+                raise RuntimeError("group commit failed") from self._err
         return lsn
 
-    def _run(self) -> None:
+    def _run(self):
         while True:
             with self._cv:
                 while not self.log.pending() and not self._stop:
@@ -336,24 +349,23 @@ class GroupCommitter:
                 seal = self.log.commit()
             except BaseException as e:
                 with self._cv:
-                    self._error = e
+                    self._err = e
                     self._cv.notify_all()
                 return
             if seal is not None:
                 with self._cv:
                     self.batches.append(seal.last_lsn - seal.first_lsn + 1)
-                    self._durable_lsn = seal.last_lsn
+                    self._durable = seal.last_lsn
                     self._cv.notify_all()
 
-    def close(self) -> None:
+    def close(self):
         with self._cv:
             self._stop = True
             self._cv.notify_all()
-        self._thread.join()
+        self._t.join()
 
 
-def _write_all(fd: int, buf: bytes) -> None:
+def _write_all(fd, buf):
     view = memoryview(buf)
     while view:
-        n = os.write(fd, view)
-        view = view[n:]
+        view = view[os.write(fd, view):]

@@ -1,19 +1,9 @@
-"""sealwal: a tamper-evident write-ahead log with (post-quantum) signed group commits."""
+"""sealwal: tamper-evident write-ahead log with post-quantum signed group commits."""
 
 from .log import CorruptLogError, GroupCommitter, SealedLog
 from .signers import ALG_IDS, make_signer, verify_signature
-from .verify import Report, check_proof, prove, verify
+from .privacy import Erased, KeyStore
+from .verify import (Report, check_consistency, check_proof, prove, prove_consistency,
+                     read_records, verify)
 
-__all__ = [
-    "SealedLog",
-    "GroupCommitter",
-    "CorruptLogError",
-    "make_signer",
-    "verify_signature",
-    "verify",
-    "prove",
-    "check_proof",
-    "Report",
-    "ALG_IDS",
-]
-__version__ = "0.1.0"
+__version__ = "0.3.0"

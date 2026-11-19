@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sealwal"
-version = "0.1.0"
-description = "Tamper-evident write-ahead log with post-quantum (ML-DSA) signed group commits"
+version = "0.3.0"
+description = "Tamper-evident write-ahead log with private, erasable records and post-quantum signed group commits"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Ahmad Rahdari" }]

@@ -1,214 +1,264 @@
 # sealwal
 
-**A tamper-evident write-ahead log with post-quantum signed group commits.**
+**A tamper-evident write-ahead log with private, erasable records and post-quantum signed group commits.**
 
-`sealwal` is a research prototype that asks a simple systems question: *what
-does it cost to make a database's write-ahead log tamper-evident with
-post-quantum (FIPS 204 ML-DSA) signatures, and how do you keep that cost off
-the commit path?*
+`sealwal` is a research prototype built around one question: *can a database
+stop trusting the storage under its WAL without paying for it on the commit
+path, leaking data through its proofs, or giving up the right to erasure?*
 
-Each group commit is closed by a **seal**: a Merkle root over the batch's
-records, chained to the previous seal and signed. Anyone holding the public key
-can verify the whole log, or check a single record with a compact inclusion
-proof, without trusting the storage the log lives on.
+Every group commit is closed by a **seal** that carries the head of a Merkle
+history tree over the whole log, chained to the previous seal. Leaves are
+salted commitments, not payloads. Anyone with the public key can verify the
+log, check that it only grew, or check a single record from a small receipt,
+without seeing the other records and without trusting the storage.
 
 ```
  DATA DATA DATA SEAL#0 | DATA SEAL#1 | DATA DATA SEAL#2 SIG(#2) | ...
- └─── batch 0 ───┘        └ batch 1 ┘   └─── batch 2 ───┘
- SEAL#j = (seal_no, first_lsn, last_lsn, MerkleRoot(batch j), digest(SEAL#j-1), [signature])
+ └─── commit 0 ───┘       └ commit 1 ┘  └─── commit 2 ───┘
+ leaf_i  = H(0x00 | lsn | c_i)          c_i = H(tag | salt_i | payload_i)
+ SEAL#j  = (j, first_lsn, last_lsn, root of the tree over records 1..last, digest(SEAL#j-1))
 ```
 
 ## Why
 
-Cloud database systems increasingly put their WAL on storage they do not fully
-control: remote block storage, dedicated multi-tenant log services, and cheap
-object storage for archived log segments. Whoever can write that storage can
-silently rewrite history. Some systems already ship tamper evidence for this
-(SQL Server / Azure SQL's ledger feature, for example, hash-chains transactions
-and stores digests externally). Two things make the question interesting
-again:
+Cloud databases keep their WAL more and more on storage they don't control:
+log services, their replicas, and object storage for archived segments.
+Whoever can write there can rewrite history. Hash chains and Merkle trees fix
+that in principle, but three things get in the way:
 
-* **Long retention + quantum.** Audit logs are kept for years. A signature that
-  a future quantum computer can forge weakens every integrity claim made about
-  the archive, so long-lived logs are a natural place for post-quantum
-  signatures.
-* **PQ signatures are not free.** On this test machine one ML-DSA-65 signature
-  takes about 0.9 ms, while a durable local flush (`fdatasync`) takes about
-  0.15 ms. Signed inline, the signature, not the disk, sets the commit latency.
+* **Post-quantum signatures are slow next to a fast flush.** Audit logs live
+  for years, so their signatures should survive quantum computers. One
+  ML-DSA-65 signature takes about 610 µs here, while a low-latency log service
+  flushes in 10-100 µs. Signed inline, the signature sets the commit latency.
+* **Merkle receipts leak the neighbours.** An inclusion proof contains the leaf
+  of the next record. If leaves are `H(record)` and the record is a balance or
+  a diagnosis code, you can brute-force it. With a plain receipt I recovered a
+  neighbouring balance (out of 10^6 candidates) in 0.71 s.
+* **Immutability vs. erasure.** GDPR wants personal data deletable. Deleting a
+  record from a Merkle log changes every hash above it.
 
 ## What it does
 
-* Append-only log with **group commit**: one `write()` + one flush per batch.
-* **Seals** with an RFC 9162-style Merkle tree (any batch size) and a digest
-  chain that is bound to the header, so batches cannot be modified, dropped,
-  reordered or spliced between logs.
-* Signatures: `ed25519`, `ml-dsa-44`, `ml-dsa-65`, `ml-dsa-87`, or `none` (baseline).
-* Three **signing policies**: sign every seal inline; sign every *k*-th seal;
-  or **asynchronous** signing by a background thread, which takes signing off
-  the critical path at the cost of a short, measured *authentication window*.
-* **Crash recovery**: torn tails and uncommitted records are truncated;
-  committed-but-unsigned seals left by a crash are re-signed.
-* **Rollback detection** with external anchors (`log.anchor()`).
-* **Inclusion proofs** for single records (log2(batch) hashes + one signature).
-* A small key-value store example and a benchmark harness.
+* **Group commit** with one `write()` and one flush per batch. A record is
+  committed once its seal is durable.
+* **History-tree seals** (RFC 9162 hashing) with a digest chain bound to the
+  header. A signature on seal *j* covers every record and seal up to *j*.
+* **Private records.** Each data subject gets a key. The salt is
+  `HMAC(k_s, "salt"|lsn)` and the payload is AES-GCM encrypted with the LSN and
+  subject as associated data. Receipts and audits only ever see commitments.
+* **Erasure by crypto-shredding.** Deleting a subject's key makes its records
+  unreadable and unguessable. Every signature, every other receipt and every
+  consistency proof still verifies.
+* **Keyless audit.** Structure, chain, roots, signatures and append-only can all
+  be checked without any subject key.
+* **Receipts** for single records, with or without the opening, and
+  **consistency proofs** between two seals (the log only grew).
+* **Signing off the commit path**: inline, every *k*-th seal, or a background
+  signer with a bound *K* on how many committed seals may be unsigned.
+* **Epoch-stateful LMS/HSS** (RFC 8554) signatures, about as fast as Ed25519
+  and hash-based only. See below for how the state is kept.
+* Ed25519, ML-DSA-44/65/87 and a hybrid Ed25519 + ML-DSA-65 mode as well.
+* **Crash recovery** (torn tails, uncommitted records, unsigned tail) and
+  rollback detection with external anchors.
 
 ## Quick start
 
-Requires Python ≥ 3.10 and `cryptography` with ML-DSA support (tested with 50.0.1).
+Needs Python ≥ 3.10, `cryptography` with ML-DSA support (tested with 50.0.1),
+and OpenSSL headers for the small C core used by the HSS signer.
 
 ```bash
-pip install -e .            # or just: pip install cryptography
-python -m pytest -q         # 106 tests
+pip install -e .
+make -C csrc                # builds sealwal/_lmots.so
+python -m pytest -q         # 127 tests
 
-python -m sealwal keygen --alg ml-dsa-65 --out key
-python -m sealwal demo   --key key --log demo.wal -n 1000
+python -m sealwal keygen --alg lms-hss --out key
+python -m sealwal demo   --alg lms-hss --key key --log demo.wal -n 1000
 python -m sealwal verify demo.wal --pubkey key.pub
 python -m sealwal prove  demo.wal --lsn 42 > proof.json
 python -m sealwal check  proof.json --pubkey key.pub
 
-python examples/kvstore.py  # crash, recover, then detect an offline edit
+python examples/kvstore.py  # private records, crash, erasure, keyless audit
 ```
 
 As a library:
 
 ```python
-from sealwal import SealedLog, GroupCommitter, make_signer, verify
+from sealwal import KeyStore, SealedLog, make_signer, prove, check_proof, verify
 
-signer = make_signer("ml-dsa-65")
-log = SealedLog.create("db.wal", signer, async_sign=True)
-gc = GroupCommitter(log)
-lsn = gc.submit(b'{"op":"put","k":"alice","v":70}')   # returns once durable
-gc.close(); log.close()
+signer = make_signer("lms-hss")
+keys = KeyStore("subjects.json", create=True)
+keys.add_subject(7)                                   # customer 7
 
-report = verify("db.wal", signer.public_bytes)
-assert report.ok and report.unauthenticated_seals == 0
+log = SealedLog.create("db.wal", signer, keys=keys)
+lsn = log.append(b'{"acct":7,"balance":70}', subject=7)
+log.commit(); log.close()
+
+receipt = prove("db.wal", lsn, keys=keys)              # opening + audit path
+assert check_proof(receipt, signer.public_bytes)
+
+keys.shred(7)                                         # erase customer 7
+assert verify("db.wal", signer.public_bytes, keys=keys).ok
 ```
 
 ## Design
 
-**Format.** A header (algorithm, public key) followed by CRC-framed `DATA`,
-`SEAL` and `SIG` frames. CRCs only detect torn writes; security comes from the
-seals. See `sealwal/format.py` for the byte layout.
+**Format.** A header (algorithm, public key), then CRC-framed `DATA`, `SEAL`
+and `SIG` frames. CRCs only catch torn writes; the seals do the security work.
+A damaged frame counts as a torn tail only if no well-formed frame follows it.
+Otherwise recovery refuses to truncate, so tampering can't pass for a crash.
+Byte layout in `sealwal/format.py`.
 
-**Commit protocol.** `append()` buffers; `commit()` writes the batch and its
-seal in one `write()` and flushes. A record is committed when its seal is
-durable. Anything after the last seal is an uncommitted transaction and is
-discarded on recovery.
+**Seals.** `digest_j = H("sealwal/seal/v2" | j | first | last | root_j | digest_{j-1})`,
+with `digest_{-1}` derived from the header. `root_j` covers the whole log, so the
+writer only keeps the O(log n) right frontier of the tree.
 
-**Seal chain.** `digest_j = H("sealwal/seal/v1" | seal_no | first_lsn | last_lsn | root_j | digest_{j-1})`,
-with `digest_{-1}` derived from the header. A signature over `digest_j`
-therefore authenticates seals `0..j` and every record in them, which is what
-makes sign-every-*k* and async signing sound.
+**Signing modes.**
 
-**Signing policies.**
-
-| policy | commit waits for signature? | unsigned committed seals |
+| mode | commit waits for a signature? | unsigned committed seals |
 |---|---|---|
-| `sign_every=1` (default) | yes | never |
+| inline (default) | yes | never |
 | `sign_every=k` | 1 in *k* commits | up to *k*−1 |
-| `async_sign=True` | no | for one signing time, roughly (the *authentication window*) |
+| `async_sign=True, max_unsigned=K` | only if more than *K* are unsigned | at most *K* |
+| `async_sign=True` | no | unbounded (the *authentication window*) |
 
-The async signer always signs the *newest* seal digest, so when commits arrive
+The background signer always signs the newest seal, so when commits arrive
 faster than signatures, one signature covers many seals.
 
-**Verification** (`verify()`) replays the log and checks LSN continuity, batch
-boundaries, Merkle roots, the digest chain, and every signature against a
-**pinned** public key. The key in the header is attacker-controlled if the file
-is, so verifying against it alone is reported as a warning.
+**Epoch-stateful HSS.** LMS keys are trees of one-time keys, and using one twice
+breaks security. Normally that means a durable index write per signature. A
+WAL already has a natural boundary, recovery, so the key is two-level:
+
+* the top tree has one leaf per **epoch**, and the key file keeps an epoch
+  counter that is fsynced *before* an epoch is used;
+* the bottom tree of an epoch is derived from the seed, and its index only
+  lives in memory;
+* every process start (and every full bottom tree) opens a new epoch, and the
+  next epoch's tree is built in the background.
+
+A crash wastes the rest of an epoch but never reuses a leaf, and the commit
+path never writes state. A file lock keeps two processes on one key file
+apart. For a primary and its standbys, `lms.split_keyfile` gives each replica
+its own slice of epochs under the same public key, so even a split brain can't
+reuse a leaf. The one thing you must not do is restore a key file from a backup.
+
+**Privacy.** The leaf only depends on `c = H(tag | salt | payload)`, and the salt
+comes from the subject key. A receipt holder sees salted commitments of the
+other records, which tell them nothing. A transfer between two customers is
+written as two records in the same commit, one per subject, so each can be
+erased on its own.
 
 ## Threat model
 
-*In scope:* an adversary who can read and write the log's storage (a
-compromised log node, an operator with bucket access, an archived segment
-edited at rest) but does not hold the signing key. Detected: modified, inserted,
-deleted or reordered records; dropped or reordered batches; a log rebuilt under
-a different key; and, **with an external anchor**, rollback (cutting off the
-most recent batches).
+*In scope:* someone who can read and write the log's storage (a compromised
+log node, an operator with bucket access, an archived segment edited at rest)
+but holds neither the signing key nor the subject keys. Detected: modified,
+inserted, deleted or reordered records; dropped or reordered commits; a log
+rebuilt under another key; forks, via consistency proofs; and, **with an
+anchor**, rollback.
 
-*Out of scope:* an adversary holding the signing key (keep it in an HSM or an
-enclave); confidentiality (payloads are not encrypted); availability.
+*Out of scope:* a compromised running engine (it can sign anything); metadata
+such as positions, subject ids, sizes and timing; confidentiality of public
+records; availability.
 
-*Known windows:* records in seals not yet covered by a signature (async mode,
-or `sign_every>1`) are protected against corruption but not yet authenticated.
-Without an anchor, a log truncated at a seal boundary is indistinguishable from
-a shorter log.
+*Assumptions:* epoch safety needs a key file that can't be rolled back, and
+erasure needs the key store's backups to be shredded too. Erasure can't take
+back openings you already handed out in receipts.
 
 ## Results
 
-Setup: a shared 2-vCPU Linux VM, ext4, Python 3.13, 256-byte records,
-`fdatasync` on every commit, single runs of 2 s per configuration. Treat
-absolute numbers as indicative; the *ratios* are the point. Reproduce with
-`python bench/bench.py && python bench/plot.py`. Raw data: `results/*.csv`.
+Setup: a shared 2-vCPU VM, ext4, Python 3.13, 256-byte records, three runs per
+configuration (median). "Emulated" means the flush is a calibrated busy-wait,
+to model a low-latency log service. Numbers on a shared VM are noisy (up to
+about 20% between runs), so look at the ratios. Reproduce with
+`python bench/bench.py && python bench/extra.py && python bench/plot.py`;
+raw data is in `results/`.
 
-![commit latency](results/commit_latency.png)
+![commit latency vs flush latency](results/flush_sweep.png)
 
-**Batch sweep (one writer).** Median commit latency / throughput / bytes stored per record:
+**Signing primitives** (p50):
 
-| records per commit | none | Ed25519 | ML-DSA-44 | ML-DSA-65 | ML-DSA-87 |
-|---|---|---|---|---|---|
-| 1  | 150 µs · 5.8k/s · 372 B | 222 µs · 3.9k/s · 436 B | 773 µs · 1.1k/s · 2.8 KB | 1,145 µs · 0.7k/s · 3.7 KB | 1,315 µs · 0.6k/s · 5.0 KB |
-| 64 | 419 µs · 142k/s · 275 B | 521 µs · 111k/s · 276 B | 1,018 µs · 52k/s · 312 B | 1,274 µs · 43k/s · 326 B | 1,608 µs · 34k/s · 347 B |
+| scheme | sign | verify | signature | public key |
+|---|---|---|---|---|
+| Ed25519 | 32 µs | 105 µs | 64 B | 32 B |
+| ML-DSA-65 | 610 µs | 159 µs | 3,309 B | 1,952 B |
+| ML-DSA-87 | 788 µs | 254 µs | 4,627 B | 2,592 B |
+| epoch HSS (W4, h=10/10) | 50 µs | 105 µs | 5,076 B | 60 B |
 
-![group commit](results/group_commit.png)
+Building the next epoch's tree takes 76 ms, in the background.
 
-**Group commit (N client threads, one committer).** Client-observed median latency / throughput:
+**Commit path.** With a 10 µs emulated flush, a one-record commit takes 18 µs
+unsigned, 652 µs with inline ML-DSA-65, 71 µs with epoch HSS and 34 µs with
+async ML-DSA-65. Group commit with real `fdatasync` and 16 clients:
 
-| clients | none | Ed25519 inline | ML-DSA-65 inline | ML-DSA-65 async | async auth. window p50 / p99 |
-|---|---|---|---|---|---|
-| 1  | 223 µs · 4.0k/s | 317 µs · 2.8k/s | 1,225 µs · 0.7k/s | 228 µs · 3.8k/s | 2.0 / 7.1 ms |
-| 16 | 1,230 µs · 11.4k/s | 1,805 µs · 8.6k/s | 3,086 µs · 4.6k/s | 1,018 µs · 11.2k/s | 2.5 / 9.1 ms |
-| 64 | 4,981 µs · 12.3k/s | 5,868 µs · 10.5k/s | 7,336 µs · 8.1k/s | 5,205 µs · 11.0k/s | 4.9 / 15.8 ms |
+| configuration | records/s | p99 window |
+|---|---|---|
+| unsigned | 11,094 | – |
+| ML-DSA-65 inline | 4,784 | – |
+| epoch HSS inline | 7,248 | – |
+| ML-DSA-65 async, *K* = 1 | 5,033 | 5.5 ms |
+| ML-DSA-65 async, *K* = 4 | 8,750 | 7.1 ms |
+| ML-DSA-65 async, unbounded | 11,944 | 10.5 ms |
 
-**Verification and proofs.** Verifying a 100k-record log (batches of 64)
-takes 0.27 s without signatures, 0.52 s with Ed25519 and 0.57 s with ML-DSA-65.
-An inclusion proof carries 6 audit-path hashes; as JSON it is about 1.3 KB with
-Ed25519 and about 7.9 KB with ML-DSA-65, most of that the hex-encoded signature.
+![K sweep](results/ksweep.png)
 
-**What the numbers say.**
+**Key-value workload** (YCSB-A-like: 8 threads, 50% reads, 50% updates,
+Zipfian keys, `fdatasync`):
 
-1. **Signed inline, ML-DSA dominates commit latency.** One-record commits go
-   from 150 µs to 1.15 ms with ML-DSA-65 (about 7.6×). Ed25519 adds only about 70 µs.
-2. **Batching amortizes throughput and space, not latency.** At 64 records per
-   commit, ML-DSA-65 costs +19 % bytes per record, but every commit still pays
-   about 0.9 ms of signing.
-3. **Async signing recovers baseline performance.** Latency and throughput
-   return to the level of the unsigned baseline. (At 4 clients the async run
-   even beat the baseline run, which mostly shows how noisy a shared 2-vCPU
-   VM is; repeated runs on dedicated hardware are a to-do.) The price is
-   an authentication window of about 2 ms median (7 to 16 ms p99 under load)
-   in which committed seals are not yet signed.
+| configuration | ops/s | vs. unsigned |
+|---|---|---|
+| unsigned, public | 10,019 | 100% |
+| ML-DSA-65 inline, public | 4,638 | 46% |
+| ML-DSA-65 async *K*=1, private | 5,292 | 53% |
+| epoch HSS inline, public | 6,771 | 68% |
+| epoch HSS inline, private | 6,455 | 64% |
+
+**Privacy and erasure.** In a tight loop at 64 records per commit, private
+records cost 23% of throughput (Python; it's one HMAC, one AES-GCM and two
+hashes per record). On 100k private records from 10k subjects, a keyless audit
+takes 0.56 s and erasing a subject 9.4 ms. Shredding cost is all in the key
+store: the simple JSON store here takes 1.07 s at a million subjects.
+
+**Crashes and corruption.** 600 random crash points (truncation plus up to 30
+junk bytes) all recovered to exactly the last surviving seal and verified, and
+each HSS restart used a new epoch. 600 random single-bit flips before the last
+frame were all refused.
+
+**Proofs.** Verifying 100k records takes 0.68 s (ML-DSA-65) / 0.51 s (HSS). A
+receipt has 11 sibling hashes; as JSON it's 8.4 KB with ML-DSA-65 and 12 KB with
+HSS, most of it the signature.
 
 ## Limitations and next steps
 
-* Python prototype: a Rust or C++ implementation would show the true
-  CPU cost of hashing and framing; signing itself already runs in native code.
-* Single segment file; no segment rotation, archival or key rotation yet.
-* Next: run against a low-latency remote log, where the flush costs tens of
-  µs and inline signing hurts even more; bound the authentication window
-  explicitly (sign when *t* ms or *k* seals have passed); evaluate stateful
-  hash-based signatures (LMS/XMSS), whose required state counter maps
-  naturally onto a log's monotonic LSN; attest table-format snapshots
-  (Apache Iceberg / Delta) with the same seal construction.
+* Python prototype on a shared VM; signing and hashing run in native code but
+  framing doesn't. Next is a real engine (PostgreSQL, or LeanStore with BtrLog)
+  and TPC-C on dedicated hardware.
+* One segment file; no segment rotation, archival or key rotation yet.
+* The key store is a JSON file; a KMS would make shredding O(1).
+* Records are classified as public or private at write time.
+* A formal model (Tamarin) of commit, signing, recovery and erasure is in progress.
 
 ## Layout
 
 ```
 sealwal/format.py    on-disk format, seal digests
-sealwal/merkle.py    RFC 9162-style Merkle tree and audit paths
-sealwal/signers.py   Ed25519 / ML-DSA / none behind one interface
-sealwal/log.py       SealedLog writer, signing policies, recovery, GroupCommitter
-sealwal/verify.py    verifier, inclusion proofs
-sealwal/__main__.py  CLI
-examples/kvstore.py  key-value store on top of sealwal
-bench/               benchmark harness and plotting
-tests/               pytest suite (tamper, rollback, torn tail, proofs, concurrency)
+sealwal/merkle.py    RFC 9162 tree, audit paths, consistency proofs
+sealwal/privacy.py   commitments, per-subject keys, AES-GCM, shredding
+sealwal/signers.py   Ed25519 / ML-DSA / hybrid / HSS behind one interface
+sealwal/lms.py       LMS/HSS (RFC 8554), epoch key file, replica split
+csrc/lmots.c         LM-OTS chains and LMS tree build (OpenSSL SHA-256)
+sealwal/log.py       writer, signing modes, recovery, GroupCommitter
+sealwal/verify.py    verifier, receipts, consistency proofs
+examples/kvstore.py  key-value store with private records and erasure
+bench/               benchmarks and plots
+tests/               pytest suite
 ```
 
 ## References
 
-* RFC 9162, *Certificate Transparency Version 2.0* (Merkle tree and audit paths).
-* NIST FIPS 204, *Module-Lattice-Based Digital Signature Standard* (ML-DSA).
-* NIST SP 800-208, *Recommendation for Stateful Hash-Based Signature Schemes*.
+* RFC 9162, *Certificate Transparency Version 2.0*.
+* RFC 8554, *Leighton-Micali Hash-Based Signatures*; NIST SP 800-208.
+* NIST FIPS 204, *Module-Lattice-Based Digital Signature Standard*.
+* S. Crosby and D. Wallach, *Efficient Data Structures for Tamper-Evident Logging*, USENIX Security 2009.
 
 ## License
 

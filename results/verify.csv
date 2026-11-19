@@ -1,4 +1,5 @@
-alg,records,batch,verify_s,verify_records_per_s,proof_bytes_json,proof_path_hashes
-none,100000,64,0.272,367984,1290,6
-ed25519,100000,64,0.521,191835,1421,6
-ml-dsa-65,100000,64,0.566,176610,7913,6
+alg,records,verify_s,verify_rps,incl_hashes,incl_bytes,sig_bytes,cons_hashes
+none,100000,0.404,247658,11,1798,0,11
+ed25519,100000,0.484,206419,11,1929,64,11
+ml-dsa-65,100000,0.679,147343,11,8421,3309,11
+lms-hss,100000,0.511,195726,11,11953,5076,11

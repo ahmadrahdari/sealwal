@@ -1,65 +1,73 @@
-"""Reading, verifying and proving membership in a sealwal log.
+"""Verification and proofs.
 
-``verify()`` replays a log file and checks, in order:
+verify() replays a log and checks that
+  - LSNs are consecutive (nothing missing or reordered),
+  - each SEAL closes a non-empty batch, has the next seal number and the
+    right LSN range, chains to the previous seal, and its root matches the
+    tree over all records so far,
+  - every signature (in a SEAL or a later SIG frame) is valid under the
+    pinned public key,
+  - optionally, an anchor (seal_no, digest) saved somewhere safe is still
+    there. Without one you can't tell a rolled-back log from a short one.
 
-1. every DATA frame has the next LSN (no gaps, no reordering);
-2. every SEAL closes a non-empty batch, carries the next seal number, the
-   right LSN range, the Merkle root of exactly those records, and the digest
-   of the previous seal (so whole batches cannot be dropped or reordered);
-3. every signature (inline in a SEAL, or in a later SIG frame) is valid under
-   the pinned public key, which authenticates the seal chain up to that point;
-4. optionally, that an externally stored *anchor* (seal number + digest) is
-   present, which is the only way to detect a rollback that deletes the most
-   recent sealed batches.
-
-``prove()`` produces a compact inclusion proof for one record, which
-``check_proof()`` verifies with nothing but the public key.
+Proofs that need only the public key:
+  prove / check_proof                record i is under a signed tree head
+  prove_consistency / check_consistency
+                                     the log at an old seal is a prefix of
+                                     the log at a newer signed seal
 """
 
-from __future__ import annotations
-
-import os
+import struct
 from dataclasses import dataclass, field
 
 from . import format as fmt
 from . import merkle
+from .privacy import ZERO_SALT, Erased, commit
 from .signers import ALG_NAMES, verify_signature
 
 
 @dataclass
 class Scan:
     header: fmt.Header
-    frames: list[tuple[int, int, bytes, int]]  # (offset, type, body, end_offset)
+    frames: list            # (offset, type, body, end)
     valid_end: int
     file_size: int
-    tail_error: str | None  # decode problem at valid_end, if any
-    mid_log_corruption: bool  # a bad frame followed by more bytes
+    tail_error: str = None
+    mid_corruption: bool = False
 
 
-def scan(path: str | os.PathLike) -> Scan:
-    """Decode all frames; stop at the first one that does not decode."""
+def scan(path):
     with open(path, "rb") as f:
         buf = f.read()
     header, off = fmt.decode_header(buf)
-    frames = []
-    tail_error = None
-    mid = False
+    frames, err, mid = [], None, False
     while off < len(buf):
         try:
             ftype, body, end = fmt.decode_frame(buf, off)
         except fmt.FrameError as e:
-            tail_error = str(e)
-            # A crash can only tear the *last* write. If the bad frame's
-            # declared length ends before EOF, something in the middle of the
-            # log was modified.
-            if len(buf) - off >= 5:
-                blen = int.from_bytes(buf[off + 1 : off + 5], "big")
-                declared_end = off + 5 + blen + 4
-                mid = declared_end < len(buf)
+            err = str(e)
+            # A crash only tears the last write, and whatever follows it is
+            # junk (half a sector, preallocated space). If a well-formed frame
+            # shows up anywhere after the broken one, the damage is in the
+            # middle of the log and we must not truncate it away.
+            mid = _valid_frame_after(buf, off + 1)
             break
         frames.append((off, ftype, body, end))
         off = end
-    return Scan(header, frames, off, len(buf), tail_error, mid)
+    return Scan(header, frames, off, len(buf), err, mid)
+
+
+def _valid_frame_after(buf, start):
+    types = (fmt.DATA, fmt.SEAL, fmt.SIG)
+    for i in range(start, len(buf) - 9):
+        if buf[i] not in types:
+            continue
+        try:
+            fmt.decode_frame(buf, i)
+            return True
+        except fmt.FrameError:
+            pass
+    return False
 
 
 @dataclass
@@ -72,6 +80,10 @@ class SealInfo:
     digest: bytes
     end_offset: int
 
+    def as_dict(self):
+        return {"seal_no": self.seal_no, "first_lsn": self.first_lsn, "last_lsn": self.last_lsn,
+                "root": self.root.hex(), "prev_digest": self.prev_digest.hex()}
+
 
 @dataclass
 class Report:
@@ -79,39 +91,34 @@ class Report:
     alg: str = "none"
     signatures_checked: bool = False
     seals: int = 0
-    committed_lsn: int = 0  # last LSN covered by a seal
-    authenticated_lsn: int = 0  # last LSN covered by a valid signature
-    unauthenticated_seals: int = 0  # seals after the last valid signature
-    unsealed_records: int = 0  # DATA frames after the last seal (uncommitted)
-    torn_bytes: int = 0  # undecodable bytes at the end of the file
+    committed_lsn: int = 0         # last LSN under a seal
+    authenticated_lsn: int = 0     # last LSN under a valid signature
+    unauthenticated_seals: int = 0
+    unsealed_records: int = 0      # after the last seal = uncommitted
+    private_records: int = 0
+    erased_records: int = 0        # private records whose key was shredded
+    contents_checked: bool = False # all readable payloads matched their commitment
+    torn_bytes: int = 0
     last_seal_no: int = -1
     last_digest: str = ""
-    commit_end_offset: int = 0  # file offset just after the committed prefix
-    errors: list[str] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
+    commit_end_offset: int = 0
+    errors: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
 
-    def fail(self, msg: str) -> None:
+    def fail(self, msg):
         self.ok = False
         self.errors.append(msg)
 
 
-def verify(
-    path: str | os.PathLike,
-    public_key: bytes | None = None,
-    *,
-    trust_header_key: bool = False,
-    anchor: tuple[int, bytes] | None = None,
-    _seals_out: list | None = None,
-) -> Report:
-    """Verify a log file. See the module docstring for what is checked.
+def verify(path, public_key=None, *, trust_header_key=False, anchor=None, keys=None,
+           check_contents=True, _state_out=None):
+    """public_key: the key you expect (pin it; the header's copy can be
+    swapped by whoever can write the file). anchor: (seal_no, digest).
 
-    public_key        The key you expect the log to be signed with (pinned out
-                      of band). Strongly recommended: the key stored in the
-                      header is attacker-controlled if the file is.
-    trust_header_key  Use the header's key when no key is pinned.
-    anchor            (seal_no, digest) recorded somewhere the attacker cannot
-                      write, e.g. after each checkpoint. Detects rollback.
-    """
+    Without keys, only public payloads are checked against their commitments;
+    private records are verified structurally (enough for an auditor who
+    should not see the data). With keys, private payloads are decrypted and
+    checked too, and shredded subjects are counted as erased."""
     rep = Report()
     try:
         sc = scan(path)
@@ -120,8 +127,8 @@ def verify(
         return rep
 
     hdr = sc.header
-    rep.alg = ALG_NAMES.get(hdr.alg_id, f"unknown({hdr.alg_id})")
-    if rep.alg.startswith("unknown"):
+    rep.alg = ALG_NAMES.get(hdr.alg_id)
+    if rep.alg is None:
         rep.fail(f"unknown signature algorithm id {hdr.alg_id}")
         return rep
 
@@ -134,101 +141,114 @@ def verify(
             key = public_key
         elif trust_header_key:
             key = hdr.public_key
-            rep.warnings.append("signatures checked against the header key, which is not pinned")
+            rep.warnings.append("checked against the key in the header, which isn't pinned")
         else:
-            rep.warnings.append("no public key given: signatures NOT checked")
+            rep.warnings.append("no public key given, signatures NOT checked")
     rep.signatures_checked = key is not None or rep.alg == "none"
 
     prev = hdr.genesis_digest()
     next_lsn, next_seal = 1, 0
-    batch: list[bytes] = []
-    batch_first = None
-    digests: list[bytes] = []
-    authenticated_seal = -1
-    seals: list[SealInfo] = []
+    batch_n, batch_first = 0, None
+    tree, committed = merkle.Frontier(), merkle.Frontier()
+    digests, seals = [], []
+    signed_upto = -1
     rep.commit_end_offset = sc.frames[0][0] if sc.frames else sc.valid_end
 
-    def check_sig(seal_no: int, sig: bytes) -> bool:
+    def sig_ok(seal_no, sig):
         if key is None:
             return True
         return verify_signature(rep.alg, key, sig, fmt.signed_message(digests[seal_no]))
 
     for off, ftype, body, end in sc.frames:
+        try:
+            parsed = (fmt.parse_data(body) if ftype == fmt.DATA else
+                      fmt.parse_seal(body) if ftype == fmt.SEAL else fmt.parse_sig(body))
+        except (struct.error, fmt.FrameError):
+            rep.fail(f"offset {off}: malformed frame")
+            break
         if ftype == fmt.DATA:
-            lsn, payload = fmt.parse_data(body)
+            lsn, subject, c, data = parsed
             if lsn != next_lsn:
                 rep.fail(f"offset {off}: expected LSN {next_lsn}, found {lsn}")
                 break
+            if check_contents:
+                bad = _check_record(lsn, subject, c, data, keys, rep)
+                if bad:
+                    rep.fail(f"offset {off}: {bad}")
+                    break
             if batch_first is None:
                 batch_first = lsn
-            batch.append(merkle.leaf_hash(lsn, payload))
+            tree.append(merkle.leaf_hash(lsn, c))
+            batch_n += 1
             next_lsn += 1
+
         elif ftype == fmt.SEAL:
-            s = fmt.parse_seal(body)
+            s = parsed
+            where = f"offset {off}: seal #{s.seal_no}"
             if s.seal_no != next_seal:
                 rep.fail(f"offset {off}: expected seal #{next_seal}, found #{s.seal_no}")
                 break
-            if not batch:
-                rep.fail(f"offset {off}: seal #{s.seal_no} closes an empty batch")
+            if not batch_n:
+                rep.fail(f"{where} closes an empty batch")
                 break
             if (s.first_lsn, s.last_lsn) != (batch_first, next_lsn - 1):
-                rep.fail(
-                    f"offset {off}: seal #{s.seal_no} claims LSNs {s.first_lsn}-{s.last_lsn}, "
-                    f"batch holds {batch_first}-{next_lsn - 1}"
-                )
+                rep.fail(f"{where} claims LSNs {s.first_lsn}-{s.last_lsn}, "
+                         f"batch has {batch_first}-{next_lsn - 1}")
                 break
             if s.prev_digest != prev:
-                rep.fail(f"offset {off}: seal #{s.seal_no} does not chain to the previous seal")
+                rep.fail(f"{where} does not chain to the previous seal")
                 break
-            if merkle.root(batch) != s.root:
-                rep.fail(f"offset {off}: seal #{s.seal_no} Merkle root mismatch (records modified)")
+            if tree.root() != s.root:
+                rep.fail(f"{where} Merkle root mismatch (records modified)")
                 break
             prev = s.digest()
             digests.append(prev)
             if s.signature:
-                if not check_sig(s.seal_no, s.signature):
-                    rep.fail(f"offset {off}: invalid signature on seal #{s.seal_no}")
+                if not sig_ok(s.seal_no, s.signature):
+                    rep.fail(f"{where} has an invalid signature")
                     break
-                authenticated_seal = s.seal_no
+                signed_upto = s.seal_no
             seals.append(SealInfo(s.seal_no, s.first_lsn, s.last_lsn, s.root, s.prev_digest, prev, end))
+            committed = tree.copy()
             next_seal += 1
-            batch, batch_first = [], None
+            batch_n, batch_first = 0, None
             rep.commit_end_offset = end
+
         elif ftype == fmt.SIG:
-            seal_no, sig = fmt.parse_sig(body)
+            seal_no, sig = parsed
             if not 0 <= seal_no < len(digests):
                 rep.fail(f"offset {off}: signature for unknown seal #{seal_no}")
                 break
-            if not check_sig(seal_no, sig):
+            if not sig_ok(seal_no, sig):
                 rep.fail(f"offset {off}: invalid signature on seal #{seal_no}")
                 break
-            authenticated_seal = max(authenticated_seal, seal_no)
-            if not batch:
+            signed_upto = max(signed_upto, seal_no)
+            if not batch_n:
                 rep.commit_end_offset = end
 
     rep.seals = len(seals)
-    rep.unsealed_records = len(batch)
+    rep.unsealed_records = batch_n
+    rep.contents_checked = check_contents and (keys is not None or rep.private_records == 0)
     rep.torn_bytes = sc.file_size - sc.valid_end
     if seals:
         rep.committed_lsn = seals[-1].last_lsn
         rep.last_seal_no = seals[-1].seal_no
         rep.last_digest = seals[-1].digest.hex()
     if rep.alg == "none":
-        authenticated_seal = -1
-    # (if no key was given, authenticated_seal reflects where signatures are
-    # present but unchecked; rep.signatures_checked is False in that case)
-    if authenticated_seal >= 0:
-        rep.authenticated_lsn = seals[authenticated_seal].last_lsn
-    rep.unauthenticated_seals = len(seals) - 1 - authenticated_seal if rep.alg != "none" else len(seals)
+        rep.unauthenticated_seals = len(seals)
+    else:
+        if signed_upto >= 0:
+            rep.authenticated_lsn = seals[signed_upto].last_lsn
+        rep.unauthenticated_seals = len(seals) - 1 - signed_upto
 
-    if sc.mid_log_corruption:
+    if sc.mid_corruption:
         rep.fail(f"offset {sc.valid_end}: corrupted frame in the middle of the log ({sc.tail_error})")
     elif sc.tail_error and rep.ok:
-        rep.warnings.append(f"torn tail of {rep.torn_bytes} bytes ignored ({sc.tail_error})")
+        rep.warnings.append(f"ignored a torn tail of {rep.torn_bytes} bytes ({sc.tail_error})")
     if rep.unsealed_records:
-        rep.warnings.append(f"{rep.unsealed_records} records after the last seal are uncommitted")
+        rep.warnings.append(f"{rep.unsealed_records} records after the last seal (uncommitted)")
     if rep.alg != "none" and rep.unauthenticated_seals > 0 and rep.ok:
-        rep.warnings.append(f"{rep.unauthenticated_seals} seal(s) at the tail are not yet signed")
+        rep.warnings.append(f"{rep.unauthenticated_seals} seal(s) at the end not signed yet")
 
     if anchor is not None and rep.ok:
         a_no, a_digest = anchor
@@ -237,105 +257,183 @@ def verify(
         elif seals[a_no].digest != a_digest:
             rep.fail(f"anchored seal #{a_no} has a different digest (log was rewritten)")
 
-    if _seals_out is not None:
-        _seals_out.extend(seals)
+    if _state_out is not None:
+        _state_out["seals"] = seals
+        _state_out["tree"] = committed
     return rep
 
 
-# --------------------------------------------------------------------------
-# Inclusion proofs
-# --------------------------------------------------------------------------
+def _check_record(lsn, subject, c, data, keys, rep):
+    if subject == 0:
+        if commit(ZERO_SALT, data) != c:
+            return f"record {lsn} does not match its commitment (modified)"
+        return None
+    rep.private_records += 1
+    if keys is None:
+        return None
+    try:
+        salt, payload = keys.open(subject, lsn, data)
+    except Erased:
+        rep.erased_records += 1
+        return None
+    except ValueError as e:
+        return str(e)
+    if commit(salt, payload) != c:
+        return f"record {lsn} does not match its commitment (modified)"
+    return None
 
 
-def prove(path: str | os.PathLike, lsn: int) -> dict:
-    """Build a self-contained proof that record ``lsn`` is in the log.
-
-    The proof contains the record, its Merkle audit path inside its batch,
-    the seal headers from its batch up to the first signed seal, and that
-    signature. Size: O(log batch_size) hashes plus one signature, plus one
-    seal header per unsigned seal in between (bounded by the signing interval).
-    """
-    sc = scan(path)
-    seals: list[SealInfo] = []
-    rep = verify(path, trust_header_key=True, _seals_out=seals)
+def read_records(path, keys=None):
+    """Yield (lsn, subject, payload) for committed records. payload is None
+    for private records you can't open (no keys, or the subject was erased)."""
+    st = {}
+    rep = verify(path, trust_header_key=True, keys=keys, _state_out=st)
     if not rep.ok:
         raise ValueError("log does not verify: " + "; ".join(rep.errors))
+    for _, ftype, body, _ in scan(path).frames:
+        if ftype != fmt.DATA:
+            continue
+        lsn, subject, c, data = fmt.parse_data(body)
+        if lsn > rep.committed_lsn:
+            break
+        if subject == 0:
+            yield lsn, 0, data
+            continue
+        payload = None
+        if keys is not None:
+            try:
+                payload = keys.open(subject, lsn, data)[1]
+            except Erased:
+                pass
+        yield lsn, subject, payload
 
-    target = next((s for s in seals if s.first_lsn <= lsn <= s.last_lsn), None)
-    if target is None:
-        raise KeyError(f"LSN {lsn} is not in a committed batch")
 
-    leaves, payload = [], None
-    sigs: dict[int, bytes] = {}
-    for _off, ftype, body, _end in sc.frames:
+def _load(path, keys=None):
+    st = {}
+    rep = verify(path, trust_header_key=True, keys=keys, _state_out=st)
+    if not rep.ok:
+        raise ValueError("log does not verify: " + "; ".join(rep.errors))
+    leaves, payloads, sigs = [], {}, {}
+    for _, ftype, body, _ in scan(path).frames:
         if ftype == fmt.DATA:
-            rec_lsn, rec_payload = fmt.parse_data(body)
-            if target.first_lsn <= rec_lsn <= target.last_lsn:
-                leaves.append(merkle.leaf_hash(rec_lsn, rec_payload))
-                if rec_lsn == lsn:
-                    payload = rec_payload
+            lsn, subject, c, data = fmt.parse_data(body)
+            leaves.append(merkle.leaf_hash(lsn, c))
+            payloads[lsn] = (subject, c, data)
         elif ftype == fmt.SEAL:
             s = fmt.parse_seal(body)
             if s.signature:
                 sigs.setdefault(s.seal_no, s.signature)
-        elif ftype == fmt.SIG:
-            seal_no, sig = fmt.parse_sig(body)
-            sigs.setdefault(seal_no, sig)
+        else:
+            n, sig = fmt.parse_sig(body)
+            sigs.setdefault(n, sig)
+    return rep, st["seals"], leaves[:rep.committed_lsn], payloads, sigs
 
-    signed = sorted(n for n in sigs if n >= target.seal_no)
-    if rep.alg != "none" and not signed:
-        raise KeyError(f"seal #{target.seal_no} is not yet covered by a signature")
-    upto = signed[0] if signed else target.seal_no
-    idx = lsn - target.first_lsn
+
+def prove(path, lsn, keys=None, reveal=True):
+    """Provenance receipt for one record: its opening (payload + salt), the
+    audit path to the first signed tree head covering it, that head and its
+    signature. Siblings in the path are salted commitments, so the receipt
+    says nothing about other private records. reveal=False leaves out the
+    opening: then it only proves *some* record sits at that position.
+    O(log n) hashes and one signature."""
+    rep, seals, leaves, payloads, sigs = _load(path, keys)
+    target = next((s for s in seals if s.first_lsn <= lsn <= s.last_lsn), None)
+    if target is None:
+        raise KeyError(f"LSN {lsn} is not committed")
+    if rep.alg == "none":
+        head_no = target.seal_no
+    else:
+        later = sorted(n for n in sigs if n >= target.seal_no)
+        if not later:
+            raise KeyError(f"seal #{target.seal_no} is not signed yet")
+        head_no = later[0]
+    head = seals[head_no]
+    subject, c, data = payloads[lsn]
+    opening = None
+    if reveal:
+        if subject == 0:
+            opening = {"salt": ZERO_SALT.hex(), "payload": data.hex()}
+        else:
+            if keys is None:
+                raise KeyError("private record: pass keys=... to reveal it")
+            salt, payload = keys.open(subject, lsn, data)   # raises Erased
+            opening = {"salt": salt.hex(), "payload": payload.hex()}
     return {
-        "format": "sealwal-proof-v1",
+        "format": "sealwal-receipt-v1",
         "alg": rep.alg,
         "lsn": lsn,
-        "payload": payload.hex(),
-        "leaf_index": idx,
-        "batch_size": len(leaves),
-        "audit_path": [h.hex() for h in merkle.audit_path(idx, leaves)],
-        "seals": [
-            {
-                "seal_no": s.seal_no,
-                "first_lsn": s.first_lsn,
-                "last_lsn": s.last_lsn,
-                "root": s.root.hex(),
-                "prev_digest": s.prev_digest.hex(),
-            }
-            for s in seals[target.seal_no : upto + 1]
-        ],
-        "signature": sigs.get(upto, b"").hex(),
+        "subject": subject,
+        "commitment": c.hex(),
+        "opening": opening,
+        "tree_size": head.last_lsn,
+        "audit_path": [h.hex() for h in merkle.audit_path(lsn - 1, leaves[:head.last_lsn])],
+        "seal": head.as_dict(),
+        "signature": sigs.get(head_no, b"").hex(),
     }
 
 
-def check_proof(proof: dict, public_key: bytes) -> tuple[bool, str]:
-    """Verify a proof from ``prove()``. Returns (ok, reason)."""
-    if proof.get("format") != "sealwal-proof-v1":
+def _digest_of(d):
+    return fmt.seal_digest(d["seal_no"], d["first_lsn"], d["last_lsn"],
+                           bytes.fromhex(d["root"]), bytes.fromhex(d["prev_digest"]))
+
+
+def check_proof(proof, public_key):
+    if proof.get("format") != "sealwal-receipt-v1":
         return False, "unknown proof format"
-    seals = proof["seals"]
-    if not seals:
-        return False, "no seals in proof"
-    first = seals[0]
-    lsn = proof["lsn"]
-    if not first["first_lsn"] <= lsn <= first["last_lsn"]:
-        return False, "record LSN outside the sealed range"
-    if proof["batch_size"] != first["last_lsn"] - first["first_lsn"] + 1:
-        return False, "batch size does not match the seal"
-    if proof["leaf_index"] != lsn - first["first_lsn"]:
-        return False, "leaf index does not match the LSN"
-    leaf = merkle.leaf_hash(lsn, bytes.fromhex(proof["payload"]))
-    path = [bytes.fromhex(h) for h in proof["audit_path"]]
-    root = merkle.root_from_path(proof["leaf_index"], proof["batch_size"], leaf, path)
-    if root is None or root.hex() != first["root"]:
-        return False, "audit path does not lead to the sealed Merkle root"
-    digest = None
-    for i, s in enumerate(seals):
-        prev = bytes.fromhex(s["prev_digest"])
-        if i > 0 and (prev != digest or s["seal_no"] != seals[i - 1]["seal_no"] + 1):
-            return False, f"seal chain broken at seal #{s['seal_no']}"
-        digest = fmt.seal_digest(s["seal_no"], s["first_lsn"], s["last_lsn"], bytes.fromhex(s["root"]), prev)
-    sig = bytes.fromhex(proof["signature"])
-    if not verify_signature(proof["alg"], public_key, sig, fmt.signed_message(digest)):
-        return False, "signature does not verify under the given key"
-    return True, f"record {lsn} is included under signed seal #{seals[-1]['seal_no']}"
+    seal, lsn, size = proof["seal"], proof["lsn"], proof["tree_size"]
+    if size != seal["last_lsn"] or not 1 <= lsn <= size:
+        return False, "tree size doesn't match the seal, or LSN outside the tree"
+    c = bytes.fromhex(proof["commitment"])
+    op = proof.get("opening")
+    if op is not None and commit(bytes.fromhex(op["salt"]), bytes.fromhex(op["payload"])) != c:
+        return False, "opening doesn't match the commitment"
+    leaf = merkle.leaf_hash(lsn, c)
+    r = merkle.root_from_path(lsn - 1, size, leaf, [bytes.fromhex(h) for h in proof["audit_path"]])
+    if r is None or r.hex() != seal["root"]:
+        return False, "audit path doesn't lead to the signed tree head"
+    if not verify_signature(proof["alg"], public_key, bytes.fromhex(proof["signature"]),
+                            fmt.signed_message(_digest_of(seal))):
+        return False, "bad signature"
+    what = "record" if op is not None else "a committed record (contents not revealed)"
+    return True, f"{what} {lsn} is in the log under signed seal #{seal['seal_no']} (size {size})"
+
+
+def prove_consistency(path, old_seal, new_seal=None):
+    """The log at old_seal is a prefix of the log at new_seal (default: the
+    newest signed seal)."""
+    rep, seals, leaves, _, sigs = _load(path)
+    if not 0 <= old_seal < len(seals):
+        raise KeyError(f"no seal #{old_seal}")
+    if new_seal is None:
+        new_seal = max(sigs) if sigs and rep.alg != "none" else len(seals) - 1
+    if not old_seal <= new_seal < len(seals):
+        raise KeyError("need old_seal <= new_seal")
+    if rep.alg != "none" and new_seal not in sigs:
+        raise KeyError(f"seal #{new_seal} has no signature")
+    old, new = seals[old_seal], seals[new_seal]
+    return {
+        "format": "sealwal-consistency-v1",
+        "alg": rep.alg,
+        "old": old.as_dict(),
+        "new": new.as_dict(),
+        "new_signature": sigs.get(new_seal, b"").hex(),
+        "proof": [h.hex() for h in merkle.consistency_proof(old.last_lsn, leaves[:new.last_lsn])],
+    }
+
+
+def check_consistency(proof, public_key, trusted_old_digest=None):
+    """trusted_old_digest: the digest of the old seal as you saved it back
+    then. Without it you only learn that the two heads agree with each other."""
+    if proof.get("format") != "sealwal-consistency-v1":
+        return False, "unknown proof format"
+    old, new = proof["old"], proof["new"]
+    if trusted_old_digest is not None and _digest_of(old) != trusted_old_digest:
+        return False, "old tree head is not the one you anchored"
+    if not verify_signature(proof["alg"], public_key, bytes.fromhex(proof["new_signature"]),
+                            fmt.signed_message(_digest_of(new))):
+        return False, "bad signature on the new tree head"
+    m, n = old["last_lsn"], new["last_lsn"]
+    if not merkle.verify_consistency(m, n, bytes.fromhex(old["root"]), bytes.fromhex(new["root"]),
+                                     [bytes.fromhex(h) for h in proof["proof"]]):
+        return False, f"size {n} does not extend size {m}, history was rewritten"
+    return True, f"log only grew, {m} -> {n} records (seal #{old['seal_no']} -> #{new['seal_no']})"

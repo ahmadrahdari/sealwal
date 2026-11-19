@@ -1,55 +1,44 @@
-"""Merkle tree over the records of one sealed batch.
+"""History tree over all log records, RFC 9162 (CT v2) style.
 
-The construction follows RFC 9162 (Certificate Transparency v2), section 2.1:
+    leaf = H(0x00 | u64 lsn | c)      c = commitment to the record
+    node = H(0x01 | left | right)
 
-    leaf hash  = SHA-256(0x00 || u64be(lsn) || payload)
-    node hash  = SHA-256(0x01 || left || right)
-
-and splits a list of n leaves at the largest power of two smaller than n, so
-any batch size works (no padding). The distinct 0x00 / 0x01 prefixes prevent
-a leaf from being reinterpreted as an inner node.
-
-An inclusion proof ("audit path") lets someone check that one record belongs
-to a batch using only log2(batch size) hashes, without seeing the other
-records of the batch.
+n leaves are split at the largest power of two below n, so any size works.
+Every seal signs the root over everything committed so far, which gives
+O(log n) inclusion proofs and O(log n) consistency (append-only) proofs
+between two signed heads, as in Crosby & Wallach and Certificate Transparency.
+Frontier keeps the root up to date with O(log n) memory.
 """
-
-from __future__ import annotations
 
 import hashlib
 import struct
 
-HASH_LEN = 32
+
+def leaf_hash(lsn, c):
+    return hashlib.sha256(b"\x00" + struct.pack(">Q", lsn) + c).digest()
 
 
-def leaf_hash(lsn: int, payload: bytes) -> bytes:
-    return hashlib.sha256(b"\x00" + struct.pack(">Q", lsn) + payload).digest()
-
-
-def node_hash(left: bytes, right: bytes) -> bytes:
+def node_hash(left, right):
     return hashlib.sha256(b"\x01" + left + right).digest()
 
 
-def _split(n: int) -> int:
-    """Largest power of two strictly smaller than n (n >= 2)."""
+def _split(n):
     k = 1
     while k << 1 < n:
         k <<= 1
     return k
 
 
-def root(leaves: list[bytes]) -> bytes:
-    """Merkle tree hash (MTH) of a non-empty list of leaf hashes."""
+def root(leaves):
     if not leaves:
-        raise ValueError("a batch must contain at least one record")
+        raise ValueError("empty tree")
     if len(leaves) == 1:
         return leaves[0]
     k = _split(len(leaves))
     return node_hash(root(leaves[:k]), root(leaves[k:]))
 
 
-def audit_path(index: int, leaves: list[bytes]) -> list[bytes]:
-    """Inclusion proof for leaves[index] (RFC 9162, 2.1.3.1)."""
+def audit_path(index, leaves):
     n = len(leaves)
     if not 0 <= index < n:
         raise IndexError(index)
@@ -61,10 +50,8 @@ def audit_path(index: int, leaves: list[bytes]) -> list[bytes]:
     return audit_path(index - k, leaves[k:]) + [root(leaves[:k])]
 
 
-def root_from_path(index: int, size: int, leaf: bytes, path: list[bytes]) -> bytes | None:
-    """Recompute the root from a leaf and its audit path (RFC 9162, 2.1.3.2).
-
-    Returns None if the path has the wrong shape for (index, size)."""
+def root_from_path(index, size, leaf, path):
+    """RFC 9162 2.1.3.2. Returns None if the path doesn't fit (index, size)."""
     if not 0 <= index < size:
         return None
     fn, sn, r = index, size - 1, leaf
@@ -81,3 +68,83 @@ def root_from_path(index: int, size: int, leaf: bytes, path: list[bytes]) -> byt
         fn >>= 1
         sn >>= 1
     return r if sn == 0 else None
+
+
+class Frontier:
+    """Roots of the perfect subtrees along the right edge, (height, hash)."""
+
+    __slots__ = ("_stack", "size")
+
+    def __init__(self):
+        self._stack = []
+        self.size = 0
+
+    def append(self, leaf):
+        self._stack.append((0, leaf))
+        self.size += 1
+        while len(self._stack) > 1 and self._stack[-1][0] == self._stack[-2][0]:
+            h, right = self._stack.pop()
+            _, left = self._stack.pop()
+            self._stack.append((h + 1, node_hash(left, right)))
+
+    def root(self):
+        if not self._stack:
+            raise ValueError("empty tree")
+        r = self._stack[-1][1]
+        for _, left in reversed(self._stack[:-1]):
+            r = node_hash(left, r)
+        return r
+
+    def copy(self):
+        f = Frontier()
+        f._stack = list(self._stack)
+        f.size = self.size
+        return f
+
+
+def consistency_proof(m, leaves):
+    """Proof that the first m leaves form a prefix of all of them (RFC 9162 2.1.4.1)."""
+    if not 0 < m <= len(leaves):
+        raise ValueError(f"need 0 < m <= n (m={m}, n={len(leaves)})")
+    return _subproof(m, leaves, True)
+
+
+def _subproof(m, leaves, whole):
+    n = len(leaves)
+    if m == n:
+        return [] if whole else [root(leaves)]
+    k = _split(n)
+    if m <= k:
+        return _subproof(m, leaves[:k], whole) + [root(leaves[k:])]
+    return _subproof(m - k, leaves[k:], False) + [root(leaves[:k])]
+
+
+def verify_consistency(m, n, old_root, new_root, proof):
+    """RFC 9162 2.1.4.2."""
+    if not 0 < m <= n:
+        return False
+    if m == n:
+        return not proof and old_root == new_root
+    if m & (m - 1) == 0:
+        proof = [old_root] + list(proof)
+    if not proof:
+        return False
+    fn, sn = m - 1, n - 1
+    while fn & 1:
+        fn >>= 1
+        sn >>= 1
+    fr = sr = proof[0]
+    for c in proof[1:]:
+        if sn == 0:
+            return False
+        if fn & 1 or fn == sn:
+            fr = node_hash(c, fr)
+            sr = node_hash(c, sr)
+            while not fn & 1 and fn != 0:
+                fn >>= 1
+                sn >>= 1
+        else:
+            sr = node_hash(sr, c)
+        fn >>= 1
+        sn >>= 1
+    return sn == 0 and fr == old_root and sr == new_root
