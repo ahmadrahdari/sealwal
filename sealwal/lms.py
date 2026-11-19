@@ -34,6 +34,7 @@ import json
 import os
 import struct
 import threading
+import time
 
 try:
     _lib = ctypes.CDLL(os.path.join(os.path.dirname(__file__), "_lmots.so"))
@@ -164,11 +165,36 @@ def hss_verify(pub, msg, sig):
     return lms_verify(pub0, pub1, sig0) and lms_verify(pub1, msg, sig1)
 
 
-class EpochHss:
-    """HSS key whose top-level index is a durable epoch counter."""
+class SignerUnavailable(RuntimeError):
+    """Could not reserve an epoch right now (lock held too long, I/O error).
+    Nothing was signed; the caller may retry."""
 
-    def __init__(self, keyfile, h0=10, h1=10, create=False, prefetch=True):
+
+class SignerExhausted(RuntimeError):
+    """This key file has no ordinary epochs left. The last epoch of every
+    slice is kept back so the key can still sign its own replacement."""
+
+
+class EpochHss:
+    """HSS key whose top-level index is a durable epoch counter.
+
+    Failure behaviour (all fail closed: no signature is ever made with an
+    epoch that isn't durably reserved first):
+      - crash before the counter is fsynced: the epoch was never used, so
+        handing it out again after restart is safe
+      - crash after: the epoch is skipped, its leaves are wasted
+      - lock not obtained within lock_timeout: SignerUnavailable
+      - slice used up: SignerExhausted; sign_rotation() still works once
+      - fewer than low_water epochs left: self.low is set (raise an alarm)
+    """
+
+    def __init__(self, keyfile, h0=10, h1=10, create=False, prefetch=True, lock_timeout=5.0,
+                 low_water=8):
         self.keyfile = os.fspath(keyfile)
+        self.lock_timeout = lock_timeout
+        self.low_water = low_water
+        self.low = False
+        self._next_err = None
         if create:
             if os.path.exists(self.keyfile):
                 raise FileExistsError(self.keyfile)
@@ -190,23 +216,53 @@ class EpochHss:
         if prefetch:
             self._prefetch()
 
-    def _reserve_epoch(self):
+    def _reserve_epoch(self, rotation=False):
         # the lock makes two processes on the same key file get different
         # epochs; replicas on other machines get their own slice instead
         # (split_keyfile), since file locks across machines are unreliable
-        with open(self.keyfile + ".lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            with open(self.keyfile) as f:
-                st = json.load(f)
-            e = st["next_epoch"]
-            if e >= st.get("end_epoch", 1 << self.h0):
-                raise RuntimeError("all epochs in this key file are used")
-            st["next_epoch"] = e + 1
-            _save_state(self.keyfile, st)   # durable before the epoch is used
+        try:
+            with open(self.keyfile + ".lock", "a") as lock:
+                deadline = time.monotonic() + self.lock_timeout
+                while True:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() > deadline:
+                            raise SignerUnavailable("epoch lock held too long")
+                        time.sleep(0.005)
+                with open(self.keyfile) as f:
+                    st = json.load(f)
+                e, end = st["next_epoch"], st.get("end_epoch", 1 << self.h0)
+                if rotation:
+                    if e >= end:
+                        raise SignerExhausted("rotation epoch already used")
+                    e = end - 1
+                    st["next_epoch"] = end
+                else:
+                    if e >= end - 1:
+                        raise SignerExhausted("no epochs left in this key file; rotate the key")
+                    st["next_epoch"] = e + 1
+                    self.low = end - 1 - st["next_epoch"] < self.low_water
+                _save_state(self.keyfile, st)   # durable before the epoch is used
+        except OSError as err:
+            raise SignerUnavailable(f"cannot reserve an epoch: {err}") from err
         return e
 
-    def _open_epoch(self):
-        e = self._reserve_epoch()
+    def epochs_left(self):
+        with open(self.keyfile) as f:
+            st = json.load(f)
+        return max(0, st.get("end_epoch", 1 << self.h0) - 1 - st["next_epoch"])
+
+    def sign_rotation(self, msg):
+        """Sign once with the slice's reserved last epoch, typically a record
+        that announces the next public key. Works even when exhausted."""
+        with self._lock:
+            tree, cert = self._open_epoch(rotation=True)
+            return struct.pack(">I", 1) + cert + tree.public_key() + tree.sign(msg)
+
+    def _open_epoch(self, rotation=False):
+        e = self._reserve_epoch(rotation)
         tree = LmsTree(_sha(b"I1", self._seed, struct.pack(">I", e))[:16],
                        _sha(b"seed1", self._seed, struct.pack(">I", e)), self.h1)
         # top-level leaf e signs this epoch's public key; leaf e is used once
@@ -218,7 +274,10 @@ class EpochHss:
 
     def _prefetch(self):
         def work():
-            self._next = self._open_epoch()
+            try:
+                self._next = self._open_epoch()
+            except (SignerUnavailable, SignerExhausted) as err:
+                self._next, self._next_err = None, err
         self._bg = threading.Thread(target=work, daemon=True)
         self._bg.start()
 
@@ -228,6 +287,10 @@ class EpochHss:
             if tree.exhausted():
                 if self._use_prefetch:
                     self._bg.join()
+                    if self._next is None:
+                        err, self._next_err = self._next_err, None
+                        self._prefetch()            # try again next time
+                        raise err or SignerUnavailable("next epoch not ready")
                     self._cur, self._next = self._next, None
                     self._prefetch()
                 else:

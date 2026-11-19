@@ -1,0 +1,14 @@
+{
+ "records": 10086,
+ "txns": 4000,
+ "aborts": 0,
+ "erased_customers": 30,
+ "unreadable_records": 69,
+ "load_s": 3.33,
+ "run_s": 6.08,
+ "verify_s": 0.55,
+ "replay_s": 2.52,
+ "replay_records_per_s": 4008,
+ "all_tables_match": true,
+ "log_mb": 42.0
+}

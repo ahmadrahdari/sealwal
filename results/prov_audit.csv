@@ -1,0 +1,3 @@
+records,log_mb,segments,verify_1core_s,verify_2workers_s,records_per_s_1core,ok
+100000,34.2,18,0.58,0.37,171493,True
+1000000,339.1,18,6.2,3.07,161172,True

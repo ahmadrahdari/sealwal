@@ -148,3 +148,72 @@ def verify_consistency(m, n, old_root, new_root, proof):
         fn >>= 1
         sn >>= 1
     return sn == 0 and fr == old_root and sr == new_root
+
+
+class Tree:
+    """All leaves plus the hashes of every perfect subtree, so roots of any
+    prefix, audit paths and consistency proofs cost O(log n) hashes instead
+    of rehashing the log. The writer keeps one for checkpoints and receipts;
+    a verifier rebuilds one per segment."""
+
+    def __init__(self):
+        self.levels = [[]]
+
+    def __len__(self):
+        return len(self.levels[0])
+
+    def append(self, leaf):
+        self.levels[0].append(leaf)
+        k, i = 0, len(self.levels[0]) - 1
+        while i & 1:
+            if len(self.levels) == k + 1:
+                self.levels.append([])
+            lv = self.levels[k]
+            self.levels[k + 1].append(node_hash(lv[i - 1], lv[i]))
+            k, i = k + 1, i >> 1
+
+    def mth(self, a, b):
+        """Root of leaves[a:b], where a is a multiple of the largest power of
+        two below b - a (true for every range RFC 9162 asks for)."""
+        n = b - a
+        if n == 1:
+            return self.levels[0][a]
+        if n & (n - 1) == 0 and a % n == 0:
+            return self.levels[n.bit_length() - 1][a // n]
+        k = _split(n)
+        return node_hash(self.mth(a, a + k), self.mth(a + k, b))
+
+    def root(self, size=None):
+        return self.mth(0, size or len(self))
+
+    def path(self, index, size=None):
+        size = size or len(self)
+        out, a, b = [], 0, size
+        while b - a > 1:
+            k = _split(b - a)
+            if index < a + k:
+                out.append(self.mth(a + k, b))
+                b = a + k
+            else:
+                out.append(self.mth(a, a + k))
+                a = a + k
+        return out[::-1]
+
+    def consistency(self, m, n=None):
+        n = n or len(self)
+        if not 0 < m <= n:
+            raise ValueError("need 0 < m <= n")
+        out, a, b, whole = [], 0, n, True
+        while True:
+            if m - a == b - a:
+                if not whole:
+                    out.append(self.mth(a, b))
+                break
+            k = _split(b - a)
+            if m - a <= k:
+                out.append(self.mth(a + k, b))
+                b = a + k
+            else:
+                out.append(self.mth(a, a + k))
+                a, whole = a + k, False
+        return out[::-1]

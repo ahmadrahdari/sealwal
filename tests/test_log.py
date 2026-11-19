@@ -1,6 +1,7 @@
 import os
 import struct
 import threading
+import time
 import zlib
 
 import pytest
@@ -500,3 +501,59 @@ def test_two_processes_on_one_key_file_never_share_an_epoch(tmp_path):
         p.join()
     flat = [e for es in got for e in es]
     assert len(flat) == len(set(flat)) == 24
+
+
+def test_hss_exhaustion_fails_closed_and_keeps_a_rotation_epoch(tmp_path):
+    from sealwal import lms
+    kf = str(tmp_path / "k.json")
+    lms.EpochHss(kf, create=True, prefetch=False).close()
+    a, b = str(tmp_path / "a.json"), str(tmp_path / "b.json")
+    lms.split_keyfile(kf, [a, b])
+    # leave only two epochs in a's slice: one ordinary, one kept for rotation
+    import json as _json
+    st = _json.load(open(a))
+    st["end_epoch"] = st["next_epoch"] + 2
+    lms._save_state(a, st)
+    k = lms.EpochHss(a, prefetch=False, low_water=4)
+    assert k.low and k.epochs_left() == 0
+    msg = b"m"
+    while not k._cur[0].exhausted():
+        k._cur[0].sign(msg)
+    with pytest.raises(lms.SignerExhausted):
+        k.sign(msg)
+    sig = k.sign_rotation(b"next key: ...")
+    assert lms.hss_verify(k.public_key, b"next key: ...", sig)
+    with pytest.raises(lms.SignerExhausted):
+        k.sign_rotation(b"again")
+
+
+def test_hss_lock_timeout(tmp_path):
+    import fcntl as _f
+    from sealwal import lms
+    kf = str(tmp_path / "k.json")
+    lms.EpochHss(kf, create=True, prefetch=False).close()
+    with open(kf + ".lock", "a") as lk:
+        _f.flock(lk, _f.LOCK_EX)
+        with pytest.raises(lms.SignerUnavailable):
+            lms.EpochHss(kf, prefetch=False, lock_timeout=0.05)
+
+
+def test_async_log_stops_when_signer_runs_out(tmp_path):
+    # the commit path fails closed instead of running unsigned forever
+    s = make_signer("ed25519")
+    calls = {"n": 0}
+    real = s.sign
+
+    def flaky(m):
+        calls["n"] += 1
+        if calls["n"] > 3:
+            raise RuntimeError("no epochs left")
+        return real(m)
+    from sealwal.signers import Signer
+    bad = Signer(s.alg, s.public_bytes, s.private_bytes, flaky)
+    log = SealedLog.create(tmp_path / "a.wal", bad, sync="none", async_sign=True, max_unsigned=2)
+    with pytest.raises(RuntimeError):
+        for i in range(50):
+            log.append(b"x")
+            log.commit()
+            time.sleep(0.002)

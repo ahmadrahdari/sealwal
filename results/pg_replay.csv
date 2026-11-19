@@ -1,0 +1,10 @@
+table,live_rows,replayed_rows,match
+warehouse,1,1,True
+district,10,10,True
+customer,2970,2970,True
+item,5000,5000,True
+stock,5000,5000,True
+orders,1988,1988,True
+new_order,1988,1988,True
+order_line,19549,19549,True
+history,1973,1973,True

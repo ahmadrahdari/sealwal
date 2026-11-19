@@ -5,8 +5,9 @@
   ksweep   bounded async signing: throughput and window for K = 0..inf
   rollover HSS sign latency with and without background epoch prefetch
   faults   random crash points (truncation + torn bytes), check recovery
-  keys     erasure cost vs size of the subject key store
-  ycsb     YCSB-A-like workload on the key-value example (50/50 r/w, zipf)
+
+The key store and the end-to-end workloads moved to bench/provenance_bench.py
+and integrations/postgres/.
 """
 
 import csv
@@ -22,7 +23,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from sealwal import GroupCommitter, KeyStore, SealedLog, make_signer, verify  # noqa: E402
+from sealwal import GroupCommitter, SealedLog, make_signer, verify  # noqa: E402
 from sealwal import lms  # noqa: E402
 from sealwal.verify import scan  # noqa: E402
 from sealwal import format as fmt  # noqa: E402
@@ -185,86 +186,8 @@ def faults(tmp, trials=300):
     save("faults.csv", rows)
 
 
-def keys(tmp):
-    rows = []
-    for n in (1_000, 10_000, 100_000, 1_000_000):
-        ks = KeyStore(os.path.join(tmp, f"ks-{n}.json"), create=True)
-        ks._keys = {i: os.urandom(32) for i in range(1, n + 1)}
-        ks._save()
-        t = time.perf_counter()
-        ks.shred(n // 2)
-        took = time.perf_counter() - t
-        rows.append({"subjects": n, "shred_ms": round(took * 1e3, 1),
-                     "keystore_mb": round(os.path.getsize(ks.path) / 1e6, 1)})
-        print("keys", rows[-1], flush=True)
-    save("keystore.csv", rows)
-
-
-def ycsb(tmp, secs=3.0, nkeys=1000, users=100):
-    """50% reads (served from memory), 50% updates (logged), zipfian keys,
-    8 client threads, group commit. Each key belongs to one user."""
-    rows = []
-    zipf_w = [1 / (i + 1) ** 0.99 for i in range(nkeys)]
-    for name, alg, mode, private in [("unsigned, public", "none", {}, False),
-                                     ("ML-DSA-65 inline, public", "ml-dsa-65", {}, False),
-                                     ("ML-DSA-65 async K=1, private", "ml-dsa-65",
-                                      {"async_sign": True, "max_unsigned": 1}, True),
-                                     ("Epoch HSS inline, public", "lms-hss", {}, False),
-                                     ("Epoch HSS inline, private", "lms-hss", {}, True)]:
-        s = make_signer(alg)
-        ks = None
-        if private:
-            ks = KeyStore(os.path.join(tmp, f"y-{name}.json".replace(" ", "_")), create=True)
-            for u in range(1, users + 1):
-                ks.add_subject(u)
-        path = os.path.join(tmp, "ycsb.wal")
-        if os.path.exists(path):
-            os.remove(path)
-        log = SealedLog.create(path, s, sync="fdatasync", keys=ks, **mode)
-        gc = GroupCommitter(log)
-        state = {}
-        lock = threading.Lock()
-        ops = [0] * 8
-        stop = threading.Event()
-
-        def client(i):
-            r = random.Random(i)
-            while not stop.is_set():
-                key = r.choices(range(nkeys), zipf_w)[0]
-                if r.random() < 0.5:
-                    with lock:
-                        state.get(key)
-                else:
-                    rec = json.dumps({"k": key, "v": r.random()}).encode()
-                    subject = key % users + 1 if private else 0
-                    lsn = log.append(rec, subject)
-                    with gc._cv:
-                        gc._cv.notify_all()
-                        while gc._durable < lsn:
-                            gc._cv.wait()
-                    with lock:
-                        state[key] = rec
-                ops[i] += 1
-
-        ts = [threading.Thread(target=client, args=(i,)) for i in range(8)]
-        t0 = time.perf_counter()
-        for t in ts:
-            t.start()
-        time.sleep(secs)
-        stop.set()
-        for t in ts:
-            t.join()
-        took = time.perf_counter() - t0
-        gc.close()
-        log.close()
-        assert verify(path, s.public_bytes if alg != "none" else None, keys=ks).ok
-        rows.append({"config": name, "ops_per_s": round(sum(ops) / took)})
-        print("ycsb", rows[-1], flush=True)
-    save("ycsb.csv", rows)
-
-
 if __name__ == "__main__":
-    todo = sys.argv[1:] or ["ksweep", "rollover", "faults", "keys", "ycsb"]
+    todo = sys.argv[1:] or ["ksweep", "rollover", "faults"]
     with tempfile.TemporaryDirectory(dir=os.path.join(os.path.dirname(__file__), "..")) as tmp:
         for name in todo:
             globals()[name](tmp)

@@ -19,6 +19,12 @@ Signing modes:
                       SIG frame; commits don't wait for it
   max_unsigned=K      (async only) commit() blocks while more than K committed
                       seals are unsigned, which bounds the auth window
+
+Replication: with sink=QuorumSink(...) (replica.py) every write also goes
+to the log nodes and a commit returns once a quorum has it on disk. The
+local file is then just the writer's copy and doesn't need its own flush.
+keep_tree=True keeps every leaf and subtree hash in memory for checkpoints
+and receipts (merkle.Tree).
 """
 
 import os
@@ -61,12 +67,18 @@ class CorruptLogError(Exception):
 
 class SealedLog:
     def __init__(self, path, fd, signer, sync="fdatasync", sign_every=1,
-                 async_sign=False, max_unsigned=None, track_auth_lag=False, keys=None):
+                 async_sign=False, max_unsigned=None, track_auth_lag=False, keys=None,
+                 sink=None, keep_tree=False, offset=0):
         self.path = os.fspath(path)
         self.signer = signer
         self.keys = keys
         self._fd = fd
         self._sync = _flush_fn(sync)
+        self._sink = sink
+        self._off = offset                    # bytes written so far (for the sink)
+        self.tree = merkle.Tree() if keep_tree else None
+        self.signed_head = None               # (SealRecord, signature) of the newest signed seal
+        self._recent = {}                     # seal_no -> SealRecord, for the async signer
         self._sign_every = sign_every
         self._async = async_sign and signer.alg != "none"
         self._max_unsigned = max_unsigned if self._async else None
@@ -105,9 +117,12 @@ class SealedLog:
         """New empty log. Fails if the file exists."""
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND, 0o644)
         hdr = fmt.Header(signer.alg_id, signer.public_bytes)
-        _write_all(fd, hdr.encode())
+        raw = hdr.encode()
+        _write_all(fd, raw)
         _flush_fn(opts.get("sync", "fdatasync"))(fd)
-        log = cls(path, fd, signer, **opts)
+        log = cls(path, fd, signer, offset=len(raw), **opts)
+        if log._sink is not None:
+            log._sink.wait(log._sink.send(0, raw))
         log._prev = hdr.genesis_digest()
         return log
 
@@ -127,7 +142,7 @@ class SealedLog:
             raise CorruptLogError(rep)
         os.truncate(path, rep.commit_end_offset)
         fd = os.open(path, os.O_WRONLY | os.O_APPEND)
-        log = cls(path, fd, signer, **opts)
+        log = cls(path, fd, signer, offset=rep.commit_end_offset, **opts)
         seals = state["seals"]
         log._tree = state["tree"]
         if seals:
@@ -187,6 +202,8 @@ class SealedLog:
             # only the committing thread touches the tree
             for leaf in leaves:
                 self._tree.append(leaf)
+                if self.tree is not None:
+                    self.tree.append(leaf)
             seal = fmt.SealRecord(seal_no, first, last, self._tree.root(), prev)
             digest = seal.digest()
 
@@ -196,16 +213,22 @@ class SealedLog:
                 sig = self.signer.sign(fmt.signed_message(digest))
                 seal = fmt.SealRecord(seal_no, first, last, seal.root, prev, sig)
 
-            with self._io_lock:
-                _write_all(self._fd, b"".join(frames) + fmt.encode_seal(seal))
+            end = self._write(b"".join(frames) + fmt.encode_seal(seal))
             self._sync(self._fd)
+            if self._sink is not None:
+                self._sink.wait(end)
 
             with self._lock:
                 self._prev = self._last_digest = digest
                 self._committed_lsn = last
                 if inline:
                     self._signed_seal = seal_no
+                    self.signed_head = (seal, seal.signature)
                     self._note_signed(seal_no)
+                elif self._async:
+                    self._recent[seal_no] = seal
+                    if len(self._recent) > 4096:
+                        self._recent.pop(min(self._recent))
                 elif self.auth_lag is not None and self.signer.alg != "none":
                     self._commit_t[seal_no] = time.perf_counter()
 
@@ -232,10 +255,11 @@ class SealedLog:
                     seal_no, digest = self._to_sign
                     self._to_sign = None   # fell behind? only the newest gets signed
                 sig = self.signer.sign(fmt.signed_message(digest))
-                with self._io_lock:
-                    _write_all(self._fd, fmt.encode_sig(seal_no, sig))
+                self._write(fmt.encode_sig(seal_no, sig))
                 # not flushed here, the next commit's flush picks it up
                 with self._signed:
+                    if seal_no > self._signed_seal and seal_no in self._recent:
+                        self.signed_head = (self._recent[seal_no], sig)
                     self._signed_seal = max(self._signed_seal, seal_no)
                     self._note_signed(seal_no)
                     self._signed.notify_all()
@@ -263,12 +287,25 @@ class SealedLog:
             if seal_no < 0 or self._signed_seal >= seal_no:
                 return
         sig = self.signer.sign(fmt.signed_message(digest))
-        with self._io_lock:
-            _write_all(self._fd, fmt.encode_sig(seal_no, sig))
+        end = self._write(fmt.encode_sig(seal_no, sig))
         self._sync(self._fd)
+        if self._sink is not None:
+            self._sink.wait(end)
         with self._lock:
+            if seal_no in self._recent:
+                self.signed_head = (self._recent[seal_no], sig)
             self._signed_seal = seal_no
             self._note_signed(seal_no)
+
+    def _write(self, buf):
+        """Append to the local copy and queue for the log nodes, in one order."""
+        with self._io_lock:
+            _write_all(self._fd, buf)
+            off = self._off
+            self._off += len(buf)
+            if self._sink is not None:
+                return self._sink.send(off, buf)
+            return self._off
 
     @property
     def committed_lsn(self):

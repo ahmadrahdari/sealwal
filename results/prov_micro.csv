@@ -1,0 +1,13 @@
+op,p50_us,p99_us,note
+"ML-DSA-44 keygen (client, per session)",92.2,124.9,
+"ML-DSA-44 sign (client, per request)",404.0,1512.6,
+"ML-DSA-44 verify (engine, per request)",105.1,1648.5,
+Ed25519 sign (classical baseline),45.6,89.3,
+Ed25519 verify (classical baseline),140.7,211.1,
+"ID token verify, RS256",53.4,96.2,
+"ID token verify, ML-DSA-44 (RFC 9964)",149.8,286.8,
+"PQ envelope seal (client, ML-KEM-768)",42.2,168.8,
+PQ envelope open (engine),36.3,108.6,
+"bind (token check, key store, BIND record)",1602.6,3741.3,SQLite synchronous=FULL
+"admission check (session, counter, ML-DSA verify)",119.1,174.2,
+"TXN record (AES-GCM, encode)",7.0,41.0,

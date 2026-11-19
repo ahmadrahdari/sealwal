@@ -17,6 +17,7 @@ Proofs that need only the public key:
                                      the log at a newer signed seal
 """
 
+import os
 import struct
 from dataclasses import dataclass, field
 
@@ -36,25 +37,39 @@ class Scan:
     mid_corruption: bool = False
 
 
-def scan(path):
+def scan(path, start=None, end=None):
+    """Decode the header and every frame. With start/end, only the frames in
+    that byte range are read (a segment audit must not pay for the whole
+    file); start has to be a frame boundary, e.g. the end of a seal."""
     with open(path, "rb") as f:
-        buf = f.read()
-    header, off = fmt.decode_header(buf)
+        if start is None:
+            size = os.fstat(f.fileno()).st_size
+            buf, base = f.read() if end is None else f.read(end), 0
+        else:
+            size = os.fstat(f.fileno()).st_size
+            head = f.read(min(size, 1 << 16))
+        if start is not None:
+            f.seek(start)
+            buf, base = f.read((end if end is not None else size) - start), start
+    header, off = fmt.decode_header(buf if start is None else head)
+    if start is not None:
+        off = 0
     frames, err, mid = [], None, False
     while off < len(buf):
         try:
-            ftype, body, end = fmt.decode_frame(buf, off)
+            ftype, body, nxt = fmt.decode_frame(buf, off)
         except fmt.FrameError as e:
             err = str(e)
             # A crash only tears the last write, and whatever follows it is
             # junk (half a sector, preallocated space). If a well-formed frame
             # shows up anywhere after the broken one, the damage is in the
-            # middle of the log and we must not truncate it away.
-            mid = _valid_frame_after(buf, off + 1)
+            # middle of the log and we must not truncate it away. Inside a
+            # segment that ends before the file does, any error is damage.
+            mid = _valid_frame_after(buf, off + 1) or (end is not None and base + off < end)
             break
-        frames.append((off, ftype, body, end))
-        off = end
-    return Scan(header, frames, off, len(buf), err, mid)
+        frames.append((base + off, ftype, body, base + nxt))
+        off = nxt
+    return Scan(header, frames, base + off, size, err, mid)
 
 
 def _valid_frame_after(buf, start):
@@ -111,17 +126,22 @@ class Report:
 
 
 def verify(path, public_key=None, *, trust_header_key=False, anchor=None, keys=None,
-           check_contents=True, _state_out=None):
+           check_contents=True, _state_out=None, start=None, end_offset=None):
     """public_key: the key you expect (pin it; the header's copy can be
     swapped by whoever can write the file). anchor: (seal_no, digest).
 
     Without keys, only public payloads are checked against their commitments;
     private records are verified structurally (enough for an auditor who
     should not see the data). With keys, private payloads are decrypted and
-    checked too, and shredded subjects are counted as erased."""
+    checked too, and shredded subjects are counted as erased.
+
+    start/end_offset verify one segment only: start = {"offset", "lsn",
+    "seal_no", "prev", "frontier"} is the state right after a seal (taken
+    from a witnessed checkpoint, whose cosigned root the frontier must hash
+    to; see segment_starts). Segments verify independently, in parallel."""
     rep = Report()
     try:
-        sc = scan(path)
+        sc = scan(path, None if start is None else start["offset"], end_offset)
     except (ValueError, OSError) as e:
         rep.fail(f"cannot read log: {e}")
         return rep
@@ -152,14 +172,24 @@ def verify(path, public_key=None, *, trust_header_key=False, anchor=None, keys=N
     tree, committed = merkle.Frontier(), merkle.Frontier()
     digests, seals = [], []
     signed_upto = -1
-    rep.commit_end_offset = sc.frames[0][0] if sc.frames else sc.valid_end
+    frames = sc.frames
+    rep.commit_end_offset = frames[0][0] if frames else sc.valid_end
+    seal_base = 0
+    if start is not None:
+        prev, next_lsn, next_seal = start["prev"], start["lsn"], start["seal_no"]
+        tree = merkle.Frontier()
+        tree._stack, tree.size = list(start["frontier"]), next_lsn - 1
+        committed = tree.copy()
+        seal_base = next_seal
+        digests = [None] * next_seal
+        rep.commit_end_offset = start["offset"]
 
     def sig_ok(seal_no, sig):
         if key is None:
             return True
         return verify_signature(rep.alg, key, sig, fmt.signed_message(digests[seal_no]))
 
-    for off, ftype, body, end in sc.frames:
+    for off, ftype, body, end in frames:
         try:
             parsed = (fmt.parse_data(body) if ftype == fmt.DATA else
                       fmt.parse_seal(body) if ftype == fmt.SEAL else fmt.parse_sig(body))
@@ -216,6 +246,8 @@ def verify(path, public_key=None, *, trust_header_key=False, anchor=None, keys=N
 
         elif ftype == fmt.SIG:
             seal_no, sig = parsed
+            if seal_no < seal_base:
+                continue          # belongs to the previous segment
             if not 0 <= seal_no < len(digests):
                 rep.fail(f"offset {off}: signature for unknown seal #{seal_no}")
                 break
@@ -237,9 +269,9 @@ def verify(path, public_key=None, *, trust_header_key=False, anchor=None, keys=N
     if rep.alg == "none":
         rep.unauthenticated_seals = len(seals)
     else:
-        if signed_upto >= 0:
-            rep.authenticated_lsn = seals[signed_upto].last_lsn
-        rep.unauthenticated_seals = len(seals) - 1 - signed_upto
+        if signed_upto >= seal_base:
+            rep.authenticated_lsn = seals[signed_upto - seal_base].last_lsn
+        rep.unauthenticated_seals = len(seals) - 1 - (signed_upto - seal_base)
 
     if sc.mid_corruption:
         rep.fail(f"offset {sc.valid_end}: corrupted frame in the middle of the log ({sc.tail_error})")

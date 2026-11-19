@@ -6,4 +6,4 @@ from .privacy import Erased, KeyStore
 from .verify import (Report, check_consistency, check_proof, prove, prove_consistency,
                      read_records, verify)
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

@@ -1,6 +1,0 @@
-config,ops_per_s
-"unsigned, public",10019
-"ML-DSA-65 inline, public",4638
-"ML-DSA-65 async K=1, private",5292
-"Epoch HSS inline, public",6771
-"Epoch HSS inline, private",6455
