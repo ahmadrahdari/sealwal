@@ -1,0 +1,4 @@
+alg,records,batch,verify_s,verify_records_per_s,proof_bytes_json,proof_path_hashes
+none,100000,64,0.272,367984,1290,6
+ed25519,100000,64,0.521,191835,1421,6
+ml-dsa-65,100000,64,0.566,176610,7913,6
