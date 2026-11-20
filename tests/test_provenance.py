@@ -299,3 +299,29 @@ def test_segments_verify_independently_and_catch_tampering(tmp_path):
     # a segment start with a made-up frontier is not accepted as a cut point
     cuts2 = segment_starts(w.path, [b"\x00" * 1312] * 3, 2)
     assert cuts2 == []
+
+
+def test_segment_scan_reads_only_its_range(tmp_path):
+    # Each worker must decode only its own slice of the file; reading the
+    # whole log per segment made the parallel audit slower than a serial one.
+    from sealwal.provenance import segment_starts
+    from sealwal.verify import scan
+    w = World(tmp_path)
+    s = w.login("alice")
+    for _ in range(3):
+        for _ in range(20):
+            w.write(s, b"x")
+        w.log.commit()
+        w.checkpoint()
+    w.log.close()
+    cuts = segment_starts(w.path, w.wit.keys, 2)
+    bounds = [0] + [c["offset"] for c in cuts] + [os.path.getsize(w.path)]
+    whole = scan(w.path).frames
+    pieces = []
+    for i in range(len(bounds) - 1):
+        start = None if i == 0 else bounds[i]
+        end = bounds[i + 1] if i + 1 < len(bounds) - 1 else None
+        sc = scan(w.path, start, end)
+        assert all(f[0] >= bounds[i] and f[3] <= bounds[i + 1] for f in sc.frames)
+        pieces += sc.frames
+    assert [f[0] for f in pieces] == [f[0] for f in whole]

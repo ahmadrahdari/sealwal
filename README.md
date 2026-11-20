@@ -92,7 +92,7 @@ Needs Python ≥ 3.10, `cryptography` ≥ 50 (ML-DSA, ML-KEM) and OpenSSL header
 ```bash
 pip install -e .
 make -C csrc                 # builds sealwal/_lmots.so
-python -m pytest -q          # 145 tests
+python -m pytest -q          # 146 tests
 ```
 
 The protocol end to end, in-process:
