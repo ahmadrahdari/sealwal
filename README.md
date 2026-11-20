@@ -25,8 +25,7 @@ A quantum attacker who has broken Google's RS256 key can mint any token Google
 could have issued. What it can't change is *when* a token existed. So:
 
 1. The client makes a fresh ML-DSA-44 session key and puts
-   `nonce = H(vk | anchor_vk | t_max | r)` into a normal OIDC login (the
-   OpenPubkey / zkLogin trick). The signed ID token now vouches for the key.
+   `nonce = H(vk | anchor_vk | t_max | r)` into a normal OIDC login. The signed ID token now vouches for the key.
 2. The database logs a `BIND` record with only salted commitments:
    `c_id = H(rho, iss, aud, sub)` and `c_tok = H(rho, jwt, r)`, where
    `rho = HMAC(k_id, sid)` and `k_id` is that user's key in the key store.
